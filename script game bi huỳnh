@@ -1,4 +1,10 @@
---// H-HUB | Paper Plane Hub v2 (học cấu trúc từ HOANGHAI)
+--// H-HUB | Paper Plane Hub v3
+--// Thay đổi so với v2:
+--//  * Đợi máy bay HẾT LƯỢT mới ném tiếp (xóa / đứng yên / event kết thúc / chạm cổng)
+--//  * Tự né vật thể bằng raycast phía trước (bật/tắt trong tab Bay)
+--//  * Chỉ teleport khi chưa đứng ở Khu vực phóng, đứng sẵn rồi thì không tele lại
+--//  * Tự tăng mã ném mỗi lượt (idStep) nếu game tăng mã
+--//  * END_KW chính xác hơn, không khớp nhầm "Backend", "Island"...
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -29,17 +35,19 @@ local CFG = {
     SteerRate = 0.05, SteerY = 0,
     HoldHeight = 10, FlySpeed = 200, Push = 80, Lift = 40,
     UIAlpha = 0.25, Volume = 1,
-    -- mới (học từ HOANGHAI)
     LoopSpeed = false, WalkSpeed = 30,
     PFly = false, PFlySpeed = 2,
     InfJump = false, ESP = false,
     FullBright = false, NoFog = false,
     AntiAFK = true, AutoExecute = false, DisableKeybinds = false,
+    -- mới v3
+    AvoidObstacles = true, AvoidDist = 60, AvoidLift = 60,
+    TeleRadius = 15, StillTime = 3, GateWait = 15,
 }
 local GATE_STOP = 30
 
 ------------------------------------------------------------------
--- LƯU / ĐỌC CONFIG (JSON, giống HOANGHAI)
+-- LƯU / ĐỌC CONFIG
 ------------------------------------------------------------------
 local SAVE_FOLDER = "HHub"
 local SAVE_FILE = SAVE_FOLDER .. "/PaperPlane.json"
@@ -111,7 +119,8 @@ local Remote = folder and folder:WaitForChild("PlaneFlight", 10)
 if not Remote then gui:Destroy() return warn("Không tìm thấy PaperPlaneRemotes.PlaneFlight") end
 
 local GUID_PAT = "^%x+%-%x+%-%x+%-%x+%-%x+$"
-local END_KW = {"end", "land", "finish", "result", "reward", "crash"}
+-- Từ khóa kết thúc lượt bay (chính xác hơn bản cũ). Chỉnh theo tên event thật trong tab Log nếu cần.
+local END_KW = {"flightend", "flight_end", "flightended", "landed", "crashed", "flightresult", "flightcomplete", "roundend"}
 local throwId, flightId, ended, throwSpot, throws = nil, nil, false, nil, 0
 local idStep = nil -- nếu game tăng mã ném mỗi lượt (vd +1) thì script tự tăng theo
 log("[INFO] Remote = " .. Remote.ClassName .. " (" .. Remote:GetFullName() .. ")")
@@ -151,16 +160,19 @@ else
     warn("Executor không có hookmetamethod: hãy tự đặt mã ném bằng getgenv().SetThrowId(số)")
 end
 getgenv().SetThrowId = function(n) throwId = n end
+getgenv().SetIdStep = function(n) idStep = n end
 
 for _, r in ipairs(folder:GetChildren()) do
     if r:IsA("RemoteEvent") then
         bind(r.OnClientEvent:Connect(function(...)
             log("[S->C] " .. r.Name .. " (" .. fmt(...) .. ")")
+            local rn = r.Name:lower()
+            for _, k in ipairs(END_KW) do if rn:find(k, 1, true) then ended = true end end
             for _, v in ipairs({...}) do
                 if type(v) == "string" then
                     if v:match(GUID_PAT) then flightId = v end
                     local l = v:lower()
-                    for _, k in ipairs(END_KW) do if l:find(k) then ended = true end end
+                    for _, k in ipairs(END_KW) do if l:find(k, 1, true) then ended = true end end
                 end
             end
         end))
@@ -176,7 +188,7 @@ local function humanoid()
     return c and c:FindFirstChildOfClass("Humanoid")
 end
 
--- Khu vực phóng (cache như HOANGHAI để khỏi quét workspace liên tục)
+-- Khu vực phóng (cache để khỏi quét workspace liên tục)
 local ZONE_NAMES = {"khu vực phóng", "khu vuc phong", "launch area", "launch zone"}
 local zoneCache
 
@@ -208,7 +220,7 @@ end
 local lastZoneScan = 0
 local function findZone()
     if zoneCache and zoneCache.Parent then return zoneCache end
-    if os.clock() - lastZoneScan < 2 then return nil end -- không quét mỗi frame
+    if os.clock() - lastZoneScan < 2 then return nil end
     lastZoneScan = os.clock()
     for _, v in ipairs(workspace:GetDescendants()) do
         local hit = matchZone(v.Name)
@@ -226,13 +238,23 @@ local function getThrowCFrame()
     return throwSpot
 end
 
+-- Đã đứng gần vị trí phóng chưa? (để không tele lặp lại)
+local function nearSpot(cf)
+    local r = root()
+    if not (r and cf) then return false end
+    local d = r.Position - cf.Position
+    -- bỏ qua chênh lệch độ cao nhỏ, chỉ tính mặt phẳng ngang + độ cao vừa phải
+    local flat = Vector3.new(d.X, 0, d.Z).Magnitude
+    return flat < CFG.TeleRadius and math.abs(d.Y) < 15
+end
+
 -- Máy bay đang bay
 local inFlight, baseY, planeCache, reachedGate = false, nil, nil, false
 local lastPlaneScan = 0
 
 local function findPlane()
     if planeCache and planeCache.Parent then return planeCache end
-    if os.clock() - lastPlaneScan < 0.4 then return nil end -- throttle: trước đây quét mỗi frame
+    if os.clock() - lastPlaneScan < 0.4 then return nil end
     lastPlaneScan = os.clock()
     local id = flightId and flightId:lower()
     local r = root()
@@ -257,11 +279,16 @@ local function findPlane()
     return best
 end
 
+local function partFromPlane(p)
+    if not p then return nil end
+    if p:IsA("BasePart") then return p end
+    return p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart", true)
+end
+
 local function planeRoot()
     local p = findPlane()
     if not p then return root() end
-    if p:IsA("BasePart") then return p end
-    return p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart", true) or root()
+    return partFromPlane(p) or root()
 end
 
 -- Cổng cuối
@@ -307,7 +334,7 @@ local function pickGate()
     return best
 end
 
--- Lực đẩy
+-- Lực đẩy + né vật thể
 local thrustAtt, thrustForce
 local function clearThrust()
     if thrustForce then thrustForce:Destroy(); thrustForce = nil end
@@ -319,6 +346,17 @@ local function ensureThrust(r)
     thrustAtt = new("Attachment", {Name = "HHubThrustAtt"}, r)
     thrustForce = new("VectorForce", {Name = "HHubThrust", Attachment0 = thrustAtt,
         RelativeTo = Enum.ActuatorRelativeTo.World, ApplyAtCenterOfMass = true, Force = Vector3.zero}, r)
+end
+
+local avoidParams = RaycastParams.new()
+avoidParams.FilterType = Enum.RaycastFilterType.Exclude
+avoidParams.IgnoreWater = true
+
+local function blockingHit(origin, vec)
+    local res = workspace:Raycast(origin, vec, avoidParams)
+    if res and res.Instance and res.Instance.CanCollide and res.Instance ~= curGate then
+        return res
+    end
 end
 
 bind(RunService.Heartbeat:Connect(function()
@@ -363,41 +401,113 @@ bind(RunService.Heartbeat:Connect(function()
     local push = along < CFG.FlySpeed and CFG.Push or 0
     local lateral = hv - dir * along
     local f = Vector3.new(dir.X * push, up, dir.Z * push) - Vector3.new(lateral.X, 0, lateral.Z) * 3
+
+    -- Né vật thể: raycast phía trước, thấy vật cản thì vọt lên + lách sang bên trống
+    if CFG.AvoidObstacles then
+        avoidParams.FilterDescendantsInstances = {lp.Character, planeCache}
+        local look = math.max(CFG.AvoidDist, along * 0.4) -- bay nhanh thì nhìn xa hơn
+        local hit = blockingHit(pos, dir * look)
+        if hit then
+            local side = Vector3.new(-dir.Z, 0, dir.X)
+            local rightFree = not blockingHit(pos, side * 40)
+            local leftFree = not blockingHit(pos, -side * 40)
+            local sideDir = Vector3.zero
+            if rightFree and not leftFree then sideDir = side
+            elseif leftFree and not rightFree then sideDir = -side
+            elseif rightFree and leftFree then sideDir = side end
+            f = Vector3.new(dir.X * push * 0.6, up + CFG.AvoidLift, dir.Z * push * 0.6) + sideDir * 40
+        end
+    end
+
     thrustForce.Force = f * mass
     r.AssemblyAngularVelocity = Vector3.zero
 end))
 
--- Một lượt ném: tele -> giữ -> thả MAX lực -> bay đến cổng
+------------------------------------------------------------------
+-- MỘT LƯỢT NÉM
+-- tele (chỉ khi chưa đứng đó) -> giữ -> thả MAX lực -> bay đến cổng
+-- -> ĐỢI máy bay hết lượt rồi mới trả về để ném tiếp
+------------------------------------------------------------------
 local function throwOnce()
     local cf = getThrowCFrame()
-    if cf and root() then
+    if cf and root() and not nearSpot(cf) then
         root().CFrame = cf
         task.wait(0.3)
     end
     if #gates == 0 then scanGates() end
     flightId, ended = nil, false
     planeCache, baseY, curGate, gateChosen, reachedGate = nil, nil, nil, false, false
+    lastPlaneScan = 0
+
     Remote:FireServer("ChargeBegin", throwId)
     task.wait(CFG.ChargeHold)
     Remote:FireServer("ChargeRelease", throwId, POWER_MAX, nil)
     throws += 1
+    if idStep then throwId += idStep end -- mã ném lượt sau
     inFlight = true
+
     local t0 = os.clock()
-    while State.Running and CFG.AutoThrow and not ended and not reachedGate and os.clock() - t0 < CFG.MaxFlight do
+    local seenPlane, still = nil, 0
+    local reason = "hết giờ"
+    local lastTick = os.clock()
+
+    while State.Running and CFG.AutoThrow do
+        local now = os.clock()
+        local dt = now - lastTick
+        lastTick = now
+        local elapsed = now - t0
+
+        if ended then reason = "server báo kết thúc"; break end
+        if elapsed >= CFG.MaxFlight then reason = "quá thời gian bay"; break end
+        if reachedGate then reason = "chạm cổng"; break end
+
         if flightId then Remote:FireServer("Steer", flightId, 0, CFG.SteerY) end
+
+        -- theo dõi chính máy bay
+        local p = findPlane()
+        if p and p ~= root() and not (lp.Character and p:IsDescendantOf(lp.Character)) then seenPlane = p end
+        if seenPlane and not seenPlane.Parent and elapsed > 3 then
+            ended = true; reason = "máy bay biến mất"; break
+        end
+        local pr = seenPlane and seenPlane.Parent and partFromPlane(seenPlane)
+        if elapsed > 5 and pr then
+            if pr.AssemblyLinearVelocity.Magnitude < 2 then
+                still += dt
+                if still > CFG.StillTime then ended = true; reason = "máy bay đứng yên"; break end
+            else
+                still = 0
+            end
+        end
         task.wait(CFG.SteerRate)
     end
-    if reachedGate then
+
+    -- Chạm cổng: đợi server kết thúc lượt (hoặc máy bay biến mất / đứng yên) rồi mới ném tiếp
+    if reachedGate and not ended then
         local t1 = os.clock()
-        while State.Running and not ended and os.clock() - t1 < 6 do task.wait(0.1) end
+        still = 0
+        local last = os.clock()
+        while State.Running and CFG.AutoThrow and not ended and os.clock() - t1 < CFG.GateWait do
+            local now = os.clock()
+            local dt = now - last
+            last = now
+            if seenPlane and not seenPlane.Parent then break end
+            local pr = seenPlane and seenPlane.Parent and partFromPlane(seenPlane)
+            if pr and pr.AssemblyLinearVelocity.Magnitude < 2 then
+                still += dt
+                if still > CFG.StillTime then break end
+            else
+                still = 0
+            end
+            task.wait(0.1)
+        end
     end
+    log("[INFO] Lượt " .. throws .. " xong: " .. reason)
 end
 
 task.spawn(function()
     while State.Running do
         task.wait(0.2)
         if CFG.AutoThrow and throwId then
-            -- pcall: lỗi 1 lượt không làm chết cả vòng lặp
             local ok, err = pcall(throwOnce)
             if not ok then log("[LOI] " .. tostring(err)) end
             inFlight = false
@@ -430,7 +540,7 @@ task.spawn(function()
     end
 end)
 
--- Xuyên vật thể + WalkSpeed (throttle như HOANGHAI)
+-- Xuyên vật thể + WalkSpeed
 local stepAcc = 0
 bind(RunService.Stepped:Connect(function(_, dt)
     stepAcc += dt
@@ -463,7 +573,7 @@ bind(RunService.Stepped:Connect(function(_, dt)
     end
 end))
 
--- Anti-AFK: Idled + nhấp định kỳ
+-- Anti-AFK
 bind(lp.Idled:Connect(function()
     if not CFG.AntiAFK then return end
     pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
@@ -618,7 +728,7 @@ local function hopLow()
 end
 
 ------------------------------------------------------------------
--- AUTO EXECUTE (queue_on_teleport, như HOANGHAI)
+-- AUTO EXECUTE (queue_on_teleport)
 ------------------------------------------------------------------
 local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport) or queueonteleport
 local queued = false
@@ -797,7 +907,6 @@ local function button(page, text, fn, color)
     return b
 end
 
--- toggle trả về đối tượng có :Set() để phím tắt dùng được; tự lưu config
 local function toggle(page, label, key, onChange)
     local b = new("TextButton", {Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Color3.fromRGB(35, 40, 70),
         Text = "  " .. label, TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = Color3.new(1, 1, 1),
@@ -819,7 +928,6 @@ local function toggle(page, label, key, onChange)
         obj:Set(not CFG[key])
     end)
     refresh()
-    -- áp dụng giá trị đã lưu từ lần trước
     if onChange and CFG[key] then task.defer(onChange, true) end
     return obj
 end
@@ -857,10 +965,13 @@ end
 local pThrow = addTab("Auto Ném", "🛩")
 local status = infoLabel(pThrow, 34)
 toggle(pThrow, "Auto Ném máy bay", "AutoThrow")
-infoLabel(pThrow, 32).Text = "Lực: MAX 100% 🔒 (đã khóa)\nTự teleport đến Khu vực phóng khi ném."
+infoLabel(pThrow, 44).Text = "Lực: MAX 100% 🔒 (đã khóa)\nChỉ teleport khi chưa đứng ở Khu vực phóng.\nĐợi máy bay hết lượt mới ném tiếp."
 stepper(pThrow, "Giữ nút (giây)", "ChargeHold", 0.1, 0.3, 5, 1)
 stepper(pThrow, "Nghỉ giữa lần ném", "Between", 0.25, 0.5, 10, 2)
 stepper(pThrow, "Bay tối đa (giây)", "MaxFlight", 5, 10, 180, 0)
+stepper(pThrow, "Đứng yên = hết (giây)", "StillTime", 0.5, 1, 10, 1)
+stepper(pThrow, "Đợi sau khi chạm cổng", "GateWait", 1, 2, 60, 0)
+stepper(pThrow, "Bán kính không tele", "TeleRadius", 5, 5, 100, 0)
 button(pThrow, "📍 Lưu vị trí ném (dự phòng)", function(b)
     local r = root()
     if r then throwSpot = r.CFrame; b.Text = "📍 Đã lưu vị trí ✓" end
@@ -875,6 +986,9 @@ local pFly = addTab("Bay", "🚀")
 local flyInfo = infoLabel(pFly, 30)
 toggle(pFly, "Xuyên vật thể khi bay", "NoclipPlane")
 toggle(pFly, "Lực nâng + đẩy đến cổng", "KeepFlying")
+toggle(pFly, "Tự né vật thể", "AvoidObstacles")
+stepper(pFly, "Khoảng cách né (stud)", "AvoidDist", 10, 20, 200, 0)
+stepper(pFly, "Lực vọt khi né", "AvoidLift", 10, 10, 200, 0)
 stepper(pFly, "Độ cao giữ (stud)", "HoldHeight", 5, -20, 100, 0)
 stepper(pFly, "Tốc độ tối đa", "FlySpeed", 20, 50, 600, 0)
 stepper(pFly, "Lực đẩy trước", "Push", 10, 10, 300, 0)
@@ -892,7 +1006,7 @@ button(pFly, "🔁 Đổi cổng (thử cổng khác)", function()
     notify("Cổng", gates[gateOverride].Name .. " (" .. gateOverride .. "/" .. #gates .. ")")
 end)
 
--- Tab Người chơi (mới)
+-- Tab Người chơi
 local pPlayer = addTab("Người chơi", "🧍")
 toggle(pPlayer, "Tốc độ chạy", "LoopSpeed")
 stepper(pPlayer, "Tốc độ", "WalkSpeed", 2, 16, 250, 0)
@@ -954,7 +1068,7 @@ logLabel.AutomaticSize = Enum.AutomaticSize.Y
 button(pLog, "Copy log", function() if setclipboard then setclipboard(table.concat(logs, "\n")) end end)
 button(pLog, "Xóa log", function() logs = {} end)
 
--- Tab Cài đặt (mới)
+-- Tab Cài đặt
 local pSet = addTab("Cài đặt", "⚙")
 toggle(pSet, "Anti AFK", "AntiAFK")
 toggle(pSet, "Tắt phím tắt", "DisableKeybinds")
@@ -972,7 +1086,7 @@ infoLabel(pSet, 40).Text = "Config tự lưu mỗi khi đổi. Auto Execute cầ
 selectTab("Auto Ném")
 
 ------------------------------------------------------------------
--- PHÍM TẮT (không chạy khi đang gõ chữ, như HOANGHAI)
+-- PHÍM TẮT
 ------------------------------------------------------------------
 bind(UserInputService.InputBegan:Connect(function(input, processed)
     if processed or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
@@ -1004,8 +1118,8 @@ end))
 task.spawn(function()
     while State.Running do
         pcall(function()
-            status.Text = ("Ném: %d | Coin +%s | Mã ném: %s | Vị trí: %s"):format(
-                throws, tostring(getCoins() - startCoins), tostring(throwId or "chưa có"),
+            status.Text = ("Ném: %d | Coin +%s | Mã ném: %s | Bước: %s | Vị trí: %s"):format(
+                throws, tostring(getCoins() - startCoins), tostring(throwId or "chưa có"), tostring(idStep or "-"),
                 (zoneCache and zoneCache.Parent and "Khu vực phóng ✓") or (throwSpot and "đã lưu") or "chưa")
             local pr = inFlight and planeRoot()
             local dist = ""
@@ -1025,7 +1139,6 @@ task.spawn(function()
     end
 end)
 
--- vị trí ném: nhờ findZone chạy nền để chữ "Khu vực phóng ✓" cập nhật
 task.spawn(function()
     while State.Running and not (zoneCache and zoneCache.Parent) do
         findZone()
