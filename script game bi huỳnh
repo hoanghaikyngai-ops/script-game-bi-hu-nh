@@ -1,10 +1,13 @@
---// H-HUB | Paper Plane Hub: UI LED + Auto Ném + Tele + Bay xuyên vật thể + Nhạc
+--// H-HUB | Paper Plane Hub v2 (học cấu trúc từ HOANGHAI)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local VirtualUser = game:GetService("VirtualUser")
 local SoundService = game:GetService("SoundService")
 local Lighting = game:GetService("Lighting")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 local lp = Players.LocalPlayer
 
 if getgenv().PPHubUnload then pcall(getgenv().PPHubUnload) end
@@ -15,19 +18,53 @@ local function bind(c) conns[#conns + 1] = c return c end
 
 local POWER_MAX = 1 -- khóa cứng: luôn ném max lực
 
+-- Dán link raw script này vào đây (hoặc getgenv().PPHubURL = "...") để dùng Auto Execute
+local AUTOEXEC_URL = getgenv().PPHubURL or ""
+
 local CFG = {
     AutoThrow = false, AutoCollect = false, Noclip = false,
     NoclipPlane = true, KeepFlying = true,
     SpyBackend = false, Blur = false,
     ChargeHold = 1.2, Between = 1.5, MaxFlight = 60,
     SteerRate = 0.05, SteerY = 0,
-    HoldHeight = 10,   -- giữ máy bay cao hơn điểm xuất phát (stud)
-    FlySpeed = 200,    -- tốc độ ngang tối đa
-    Push = 80,         -- gia tốc đẩy từ sau ra trước
-    Lift = 40,         -- gia tốc nâng tối đa từ dưới lên
+    HoldHeight = 10, FlySpeed = 200, Push = 80, Lift = 40,
     UIAlpha = 0.25, Volume = 1,
+    -- mới (học từ HOANGHAI)
+    LoopSpeed = false, WalkSpeed = 30,
+    PFly = false, PFlySpeed = 2,
+    InfJump = false, ESP = false,
+    FullBright = false, NoFog = false,
+    AntiAFK = true, AutoExecute = false, DisableKeybinds = false,
 }
 local GATE_STOP = 30
+
+------------------------------------------------------------------
+-- LƯU / ĐỌC CONFIG (JSON, giống HOANGHAI)
+------------------------------------------------------------------
+local SAVE_FOLDER = "HHub"
+local SAVE_FILE = SAVE_FOLDER .. "/PaperPlane.json"
+local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+
+local function saveCfg()
+    if not canFile then return end
+    pcall(function()
+        if type(isfolder) == "function" and not isfolder(SAVE_FOLDER) then makefolder(SAVE_FOLDER) end
+        writefile(SAVE_FILE, HttpService:JSONEncode(CFG))
+    end)
+end
+
+local DEFAULT_CFG = {}
+for k, v in pairs(CFG) do DEFAULT_CFG[k] = v end
+
+pcall(function()
+    if canFile and isfile(SAVE_FILE) then
+        local d = HttpService:JSONDecode(readfile(SAVE_FILE))
+        for k, v in pairs(d) do
+            if CFG[k] ~= nil and type(v) == type(CFG[k]) then CFG[k] = v end
+        end
+    end
+end)
+CFG.AutoThrow = false -- mã ném phải lấy lại mỗi phiên nên không tự bật
 
 local function new(cls, props, parent)
     local o = Instance.new(cls)
@@ -71,11 +108,13 @@ end
 ------------------------------------------------------------------
 local folder = RS:WaitForChild("PaperPlaneRemotes", 10)
 local Remote = folder and folder:WaitForChild("PlaneFlight", 10)
-if not Remote then return warn("Không tìm thấy PaperPlaneRemotes.PlaneFlight") end
+if not Remote then gui:Destroy() return warn("Không tìm thấy PaperPlaneRemotes.PlaneFlight") end
 
 local GUID_PAT = "^%x+%-%x+%-%x+%-%x+%-%x+$"
 local END_KW = {"end", "land", "finish", "result", "reward", "crash"}
 local throwId, flightId, ended, throwSpot, throws = nil, nil, false, nil, 0
+local idStep = nil -- nếu game tăng mã ném mỗi lượt (vd +1) thì script tự tăng theo
+log("[INFO] Remote = " .. Remote.ClassName .. " (" .. Remote:GetFullName() .. ")")
 
 local BC
 pcall(function()
@@ -93,15 +132,21 @@ end
 local startCoins = getCoins()
 
 if hookmetamethod and getnamecallmethod then
+    local wrap = newcclosure or function(f) return f end
     local old
-    old = hookmetamethod(game, "__namecall", function(self, ...)
-        if State.Running and self == Remote and getnamecallmethod() == "FireServer" and not checkcaller() then
+    old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+        if State.Running and self == Remote and getnamecallmethod() == "FireServer"
+            and (type(checkcaller) ~= "function" or not checkcaller()) then
             local a = table.pack(...)
-            if a[1] == "ChargeBegin" and type(a[2]) == "number" then throwId = a[2] end
+            log("[C->S game] " .. fmt(...))
+            if a[1] == "ChargeBegin" and type(a[2]) == "number" then
+                if throwId and a[2] ~= throwId and math.abs(a[2] - throwId) <= 3 then idStep = a[2] - throwId end
+                throwId = a[2]
+            end
             if a[1] == "Steer" and type(a[2]) == "string" and not flightId then flightId = a[2] end
         end
         return old(self, ...)
-    end)
+    end))
 else
     warn("Executor không có hookmetamethod: hãy tự đặt mã ném bằng getgenv().SetThrowId(số)")
 end
@@ -126,8 +171,12 @@ local function root()
     local c = lp.Character
     return c and c:FindFirstChild("HumanoidRootPart")
 end
+local function humanoid()
+    local c = lp.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
 
--- Khu vực phóng
+-- Khu vực phóng (cache như HOANGHAI để khỏi quét workspace liên tục)
 local ZONE_NAMES = {"khu vực phóng", "khu vuc phong", "launch area", "launch zone"}
 local zoneCache
 
@@ -156,8 +205,11 @@ local function partOf(inst)
     end
 end
 
+local lastZoneScan = 0
 local function findZone()
     if zoneCache and zoneCache.Parent then return zoneCache end
+    if os.clock() - lastZoneScan < 2 then return nil end -- không quét mỗi frame
+    lastZoneScan = os.clock()
     for _, v in ipairs(workspace:GetDescendants()) do
         local hit = matchZone(v.Name)
         if not hit and (v:IsA("TextLabel") or v:IsA("TextButton")) then hit = matchZone(v.Text) end
@@ -176,9 +228,12 @@ end
 
 -- Máy bay đang bay
 local inFlight, baseY, planeCache, reachedGate = false, nil, nil, false
+local lastPlaneScan = 0
 
 local function findPlane()
     if planeCache and planeCache.Parent then return planeCache end
+    if os.clock() - lastPlaneScan < 0.4 then return nil end -- throttle: trước đây quét mỗi frame
+    lastPlaneScan = os.clock()
     local id = flightId and flightId:lower()
     local r = root()
     local best, bestD
@@ -301,9 +356,7 @@ bind(RunService.Heartbeat:Connect(function()
 
     local mass = r.AssemblyMass
     local g = workspace.Gravity
-    -- nâng từ dưới lên: bù trọng lực + kéo về độ cao giữ
     local up = g + math.clamp((baseY + CFG.HoldHeight - pos.Y) * 6, -g * 0.8, CFG.Lift)
-    -- đẩy từ sau ra trước (về phía cổng)
     local vel = r.AssemblyLinearVelocity
     local hv = Vector3.new(vel.X, 0, vel.Z)
     local along = hv:Dot(dir)
@@ -314,33 +367,39 @@ bind(RunService.Heartbeat:Connect(function()
     r.AssemblyAngularVelocity = Vector3.zero
 end))
 
--- Vòng Auto Ném: tele -> giữ -> thả MAX lực -> bay đến cổng
+-- Một lượt ném: tele -> giữ -> thả MAX lực -> bay đến cổng
+local function throwOnce()
+    local cf = getThrowCFrame()
+    if cf and root() then
+        root().CFrame = cf
+        task.wait(0.3)
+    end
+    if #gates == 0 then scanGates() end
+    flightId, ended = nil, false
+    planeCache, baseY, curGate, gateChosen, reachedGate = nil, nil, nil, false, false
+    Remote:FireServer("ChargeBegin", throwId)
+    task.wait(CFG.ChargeHold)
+    Remote:FireServer("ChargeRelease", throwId, POWER_MAX, nil)
+    throws += 1
+    inFlight = true
+    local t0 = os.clock()
+    while State.Running and CFG.AutoThrow and not ended and not reachedGate and os.clock() - t0 < CFG.MaxFlight do
+        if flightId then Remote:FireServer("Steer", flightId, 0, CFG.SteerY) end
+        task.wait(CFG.SteerRate)
+    end
+    if reachedGate then
+        local t1 = os.clock()
+        while State.Running and not ended and os.clock() - t1 < 6 do task.wait(0.1) end
+    end
+end
+
 task.spawn(function()
     while State.Running do
         task.wait(0.2)
         if CFG.AutoThrow and throwId then
-            local cf = getThrowCFrame()
-            if cf and root() then
-                root().CFrame = cf
-                task.wait(0.3)
-            end
-            if #gates == 0 then scanGates() end
-            flightId, ended = nil, false
-            planeCache, baseY, curGate, gateChosen, reachedGate = nil, nil, nil, false, false
-            Remote:FireServer("ChargeBegin", throwId)
-            task.wait(CFG.ChargeHold)
-            Remote:FireServer("ChargeRelease", throwId, POWER_MAX, nil)
-            throws += 1
-            inFlight = true
-            local t0 = os.clock()
-            while State.Running and CFG.AutoThrow and not ended and not reachedGate and os.clock() - t0 < CFG.MaxFlight do
-                if flightId then Remote:FireServer("Steer", flightId, 0, CFG.SteerY) end
-                task.wait(CFG.SteerRate)
-            end
-            if reachedGate then
-                local t1 = os.clock()
-                while State.Running and not ended and os.clock() - t1 < 6 do task.wait(0.1) end
-            end
+            -- pcall: lỗi 1 lượt không làm chết cả vòng lặp
+            local ok, err = pcall(throwOnce)
+            if not ok then log("[LOI] " .. tostring(err)) end
             inFlight = false
             clearThrust()
             task.wait(CFG.Between)
@@ -354,26 +413,36 @@ task.spawn(function()
         task.wait(0.5)
         local r = root()
         if CFG.AutoCollect and r and firetouchinterest then
-            for _, v in ipairs(workspace:GetDescendants()) do
-                if v:IsA("BasePart") then
-                    local n = v.Name:lower()
-                    for _, k in ipairs(COLLECT_KW) do
-                        if n:find(k) and (v.Position - r.Position).Magnitude < 300 then
-                            pcall(function() firetouchinterest(r, v, 0); firetouchinterest(r, v, 1) end)
-                            break
+            pcall(function()
+                for _, v in ipairs(workspace:GetDescendants()) do
+                    if v:IsA("BasePart") then
+                        local n = v.Name:lower()
+                        for _, k in ipairs(COLLECT_KW) do
+                            if n:find(k) and (v.Position - r.Position).Magnitude < 300 then
+                                firetouchinterest(r, v, 0); firetouchinterest(r, v, 1)
+                                break
+                            end
                         end
                     end
                 end
-            end
+            end)
         end
     end
 end)
 
--- Xuyên vật thể
-bind(RunService.Stepped:Connect(function()
+-- Xuyên vật thể + WalkSpeed (throttle như HOANGHAI)
+local stepAcc = 0
+bind(RunService.Stepped:Connect(function(_, dt)
+    stepAcc += dt
+    if stepAcc < 0.08 then return end
+    stepAcc = 0
     local planeNoclip = CFG.NoclipPlane and inFlight
+    if CFG.LoopSpeed then
+        local h = humanoid()
+        if h and h.WalkSpeed ~= CFG.WalkSpeed then h.WalkSpeed = CFG.WalkSpeed end
+    end
     if not CFG.Noclip and not planeNoclip then return end
-    if lp.Character then
+    if CFG.Noclip and lp.Character then
         for _, p in ipairs(lp.Character:GetDescendants()) do
             if p:IsA("BasePart") then p.CanCollide = false end
         end
@@ -386,12 +455,180 @@ bind(RunService.Stepped:Connect(function()
                 if p:IsA("BasePart") then p.CanCollide = false end
             end
         end
+        if lp.Character then
+            for _, p in ipairs(lp.Character:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide = false end
+            end
+        end
     end
 end))
 
+-- Anti-AFK: Idled + nhấp định kỳ
 bind(lp.Idled:Connect(function()
-    VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new())
+    if not CFG.AntiAFK then return end
+    pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
 end))
+task.spawn(function()
+    while State.Running do
+        task.wait(60)
+        if CFG.AntiAFK then
+            pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
+        end
+    end
+end)
+
+------------------------------------------------------------------
+-- NGƯỜI CHƠI: fly / infinite jump / ESP / ánh sáng
+------------------------------------------------------------------
+local flyConn
+local function stopFly()
+    if flyConn then flyConn:Disconnect(); flyConn = nil end
+    local h, r = humanoid(), root()
+    if h then h.PlatformStand = false end
+    if r then
+        for _, v in ipairs(r:GetChildren()) do
+            if v:IsA("BodyVelocity") or v:IsA("BodyGyro") then v:Destroy() end
+        end
+    end
+end
+local function startFly()
+    stopFly()
+    local r, h = root(), humanoid()
+    if not r or not h then return end
+    h.PlatformStand = true
+    local bv = new("BodyVelocity", {MaxForce = Vector3.new(9e9, 9e9, 9e9), Velocity = Vector3.zero}, r)
+    local bg = new("BodyGyro", {MaxTorque = Vector3.new(9e9, 9e9, 9e9), P = 1e7, D = 12000, CFrame = r.CFrame}, r)
+    flyConn = RunService.RenderStepped:Connect(function()
+        local cam = workspace.CurrentCamera
+        local mv = Vector3.zero
+        local md = h.MoveDirection
+        if md.Magnitude > 0 then
+            local lk = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+            local rt = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z)
+            if lk.Magnitude > 0.01 and rt.Magnitude > 0.01 then
+                mv = cam.CFrame.LookVector * md:Dot(lk.Unit) + cam.CFrame.RightVector * md:Dot(rt.Unit)
+            end
+        end
+        if mv.Magnitude > 0 then mv = mv.Unit end
+        bv.Velocity = mv * CFG.PFlySpeed * 50
+        bg.CFrame = CFrame.lookAt(r.Position, r.Position + cam.CFrame.LookVector)
+    end)
+end
+
+bind(lp.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    if CFG.PFly then startFly() end
+end))
+
+local lastJump = 0
+bind(UserInputService.JumpRequest:Connect(function()
+    if not CFG.InfJump or os.clock() - lastJump < 0.18 then return end
+    local h = humanoid()
+    if h and h.Health > 0 then
+        lastJump = os.clock()
+        h:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end))
+
+local function clearESP()
+    for _, p in ipairs(Players:GetPlayers()) do
+        local head = p.Character and p.Character:FindFirstChild("Head")
+        local e = head and head:FindFirstChild("HHubESP")
+        if e then e:Destroy() end
+    end
+end
+task.spawn(function()
+    while State.Running do
+        task.wait(0.5)
+        if CFG.ESP then
+            pcall(function()
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p ~= lp and p.Character then
+                        local head = p.Character:FindFirstChild("Head")
+                        if head and not head:FindFirstChild("HHubESP") then
+                            local bb = new("BillboardGui", {Name = "HHubESP", Adornee = head, Size = UDim2.fromOffset(200, 22),
+                                StudsOffset = Vector3.new(0, 2.5, 0), AlwaysOnTop = true}, head)
+                            new("TextLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = p.DisplayName,
+                                TextColor3 = Color3.new(1, 1, 1), TextStrokeTransparency = 0, Font = Enum.Font.GothamBold,
+                                TextSize = 13}, bb)
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+local origLight = {Brightness = Lighting.Brightness, ClockTime = Lighting.ClockTime, GlobalShadows = Lighting.GlobalShadows,
+    Ambient = Lighting.Ambient, OutdoorAmbient = Lighting.OutdoorAmbient, FogStart = Lighting.FogStart, FogEnd = Lighting.FogEnd}
+local function applyLight()
+    if CFG.FullBright then
+        Lighting.Brightness, Lighting.ClockTime, Lighting.GlobalShadows = 2, 14, false
+        Lighting.Ambient, Lighting.OutdoorAmbient = Color3.new(1, 1, 1), Color3.new(1, 1, 1)
+    end
+    if CFG.NoFog then Lighting.FogStart, Lighting.FogEnd = 100000, 100000 end
+end
+local function restoreLight(which)
+    if which == "bright" then
+        Lighting.Brightness, Lighting.ClockTime, Lighting.GlobalShadows = origLight.Brightness, origLight.ClockTime, origLight.GlobalShadows
+        Lighting.Ambient, Lighting.OutdoorAmbient = origLight.Ambient, origLight.OutdoorAmbient
+    else
+        Lighting.FogStart, Lighting.FogEnd = origLight.FogStart, origLight.FogEnd
+    end
+end
+bind(Lighting.Changed:Connect(function()
+    if CFG.FullBright or CFG.NoFog then applyLight() end
+end))
+
+------------------------------------------------------------------
+-- SERVER: rejoin / hop server ít người
+------------------------------------------------------------------
+local function rejoin()
+    notify("Rejoin", "Đang vào lại server...")
+    task.spawn(function()
+        pcall(function()
+            if #Players:GetPlayers() <= 1 then TeleportService:Teleport(game.PlaceId, lp)
+            else TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, lp) end
+        end)
+    end)
+end
+
+local function hopLow()
+    notify("Server Hop", "Đang tìm server ít người...")
+    task.spawn(function()
+        local ok, body = pcall(function()
+            return game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")
+        end)
+        local best
+        if ok then
+            local d = select(2, pcall(HttpService.JSONDecode, HttpService, body))
+            for _, s in ipairs(type(d) == "table" and d.data or {}) do
+                if s.id ~= game.JobId and (s.playing or 0) > 0 and (s.playing or 0) < (s.maxPlayers or 0) then
+                    if not best or s.playing < best.playing then best = s end
+                end
+            end
+        end
+        if best then
+            notify("Server Hop", "Vào server " .. best.playing .. " người")
+            pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, best.id, lp) end)
+        else
+            notify("Server Hop", "Không tìm thấy server phù hợp")
+        end
+    end)
+end
+
+------------------------------------------------------------------
+-- AUTO EXECUTE (queue_on_teleport, như HOANGHAI)
+------------------------------------------------------------------
+local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport) or queueonteleport
+local queued = false
+local function queueAutoExec()
+    if not CFG.AutoExecute or queued or not queueTp then return end
+    if AUTOEXEC_URL == "" then return notify("Auto Execute", "Chưa đặt AUTOEXEC_URL ở đầu script") end
+    queued = true
+    pcall(queueTp, ([[task.spawn(function() if not game:IsLoaded() then game.Loaded:Wait() end task.wait(2) loadstring(game:HttpGet(%q))() end)]]):format(AUTOEXEC_URL))
+end
+bind(lp.OnTeleport:Connect(function() queueAutoExec() end))
 
 ------------------------------------------------------------------
 -- NHẠC
@@ -406,7 +643,7 @@ local MusicPlaylist = {
     { Name = "TRẢ CHO ANH GOJO VS SUKUNA", Id = "110396752508363", From = 163, To = 180 },
     { Name = "Ai đưa em về", Id = "110919391228823" },
 }
-local MusicSound = new("Sound", {Name = "HHubMusicTrack", Volume = 1, Looped = true}, SoundService)
+local MusicSound = new("Sound", {Name = "HHubMusicTrack", Volume = CFG.Volume, Looped = true}, SoundService)
 local Music = {CurrentId = nil, CurrentName = "Chưa phát", PlayToken = 0, Index = 0}
 
 local function MusicCleanup()
@@ -451,7 +688,7 @@ end
 ------------------------------------------------------------------
 -- GIAO DIỆN
 ------------------------------------------------------------------
-local blur = new("BlurEffect", {Size = 0}, Lighting)
+local blur = new("BlurEffect", {Size = CFG.Blur and 14 or 0}, Lighting)
 
 local main = new("Frame", {Size = UDim2.fromOffset(500, 330), Position = UDim2.new(0.5, -250, 0.5, -165),
     BackgroundColor3 = Color3.fromRGB(12, 14, 28), BackgroundTransparency = CFG.UIAlpha,
@@ -513,18 +750,20 @@ local strip = new("Frame", {Size = UDim2.new(1, -30, 0, 3), Position = UDim2.new
 new("UICorner", {CornerRadius = UDim.new(1, 0)}, strip)
 local stripGrad = new("UIGradient", {Color = rainbow()}, strip)
 
-headBtn("—", -66, Color3.fromRGB(70, 90, 150), function()
-    minimized = not minimized
+local function setMinimized(v)
+    minimized = v
     body.Visible = not minimized
     strip.Visible = not minimized
     main.Size = minimized and UDim2.fromOffset(500, 42) or UDim2.fromOffset(500, 330)
-end)
+end
+headBtn("—", -66, Color3.fromRGB(70, 90, 150), function() setMinimized(not minimized) end)
 headBtn("X", -34, Color3.fromRGB(190, 60, 60), function()
     if getgenv().PPHubUnload then getgenv().PPHubUnload() end
 end)
 
-local side = new("Frame", {Size = UDim2.new(0, 116, 1, -10), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1}, body)
-new("UIListLayout", {Padding = UDim.new(0, 6)}, side)
+local side = new("ScrollingFrame", {Size = UDim2.new(0, 116, 1, -10), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+    ScrollBarThickness = 0, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), BorderSizePixel = 0}, body)
+new("UIListLayout", {Padding = UDim.new(0, 4)}, side)
 local content = new("Frame", {Size = UDim2.new(1, -140, 1, -14), Position = UDim2.fromOffset(132, 0),
     BackgroundColor3 = Color3.fromRGB(8, 10, 20), BackgroundTransparency = 0.5}, body)
 new("UICorner", {CornerRadius = UDim.new(0, 12)}, content)
@@ -537,8 +776,8 @@ local function selectTab(name)
     end
 end
 local function addTab(name, icon)
-    local btn = new("TextButton", {Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Color3.fromRGB(35, 40, 70),
-        Text = icon .. "  " .. name, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14}, side)
+    local btn = new("TextButton", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = Color3.fromRGB(35, 40, 70),
+        Text = icon .. "  " .. name, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13}, side)
     new("UICorner", {CornerRadius = UDim.new(0, 10)}, btn)
     local page = new("ScrollingFrame", {Size = UDim2.new(1, -10, 1, -10), Position = UDim2.fromOffset(5, 5),
         BackgroundTransparency = 1, ScrollBarThickness = 4, AutomaticCanvasSize = Enum.AutomaticSize.Y,
@@ -558,6 +797,7 @@ local function button(page, text, fn, color)
     return b
 end
 
+-- toggle trả về đối tượng có :Set() để phím tắt dùng được; tự lưu config
 local function toggle(page, label, key, onChange)
     local b = new("TextButton", {Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Color3.fromRGB(35, 40, 70),
         Text = "  " .. label, TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = Color3.new(1, 1, 1),
@@ -566,14 +806,22 @@ local function toggle(page, label, key, onChange)
     local led = new("Frame", {Size = UDim2.fromOffset(14, 14), Position = UDim2.new(1, -26, 0.5, -7)}, b)
     new("UICorner", {CornerRadius = UDim.new(1, 0)}, led)
     local function refresh() led.BackgroundColor3 = CFG[key] and Color3.fromRGB(60, 255, 120) or Color3.fromRGB(90, 90, 110) end
+    local obj = {}
+    function obj:Set(v)
+        CFG[key] = v and true or false
+        refresh(); saveCfg()
+        if onChange then onChange(CFG[key]) end
+    end
     b.MouseButton1Click:Connect(function()
         if key == "AutoThrow" and not CFG[key] and not throwId then
             return notify("Auto Ném", "Hãy ném tay 1 lần để lấy mã ném")
         end
-        CFG[key] = not CFG[key]; refresh()
-        if onChange then onChange(CFG[key]) end
+        obj:Set(not CFG[key])
     end)
     refresh()
+    -- áp dụng giá trị đã lưu từ lần trước
+    if onChange and CFG[key] then task.defer(onChange, true) end
+    return obj
 end
 
 local function stepper(page, label, key, step, min, max, dec, onChange)
@@ -591,7 +839,7 @@ local function stepper(page, label, key, step, min, max, dec, onChange)
             Font = Enum.Font.GothamBold, TextSize = 14}, row)
         new("UICorner", {CornerRadius = UDim.new(0, 6)}, b)
         b.MouseButton1Click:Connect(function()
-            CFG[key] = math.clamp(CFG[key] + d * step, min, max); refresh()
+            CFG[key] = math.clamp(CFG[key] + d * step, min, max); refresh(); saveCfg()
             if onChange then onChange(CFG[key]) end
         end)
     end
@@ -622,7 +870,7 @@ button(pThrow, "↩ Teleport đến Khu vực phóng", function()
     if r and cf then r.CFrame = cf else notify("Teleport", "Không thấy Khu vực phóng, hãy lưu vị trí tay") end
 end)
 
--- Tab Bay
+-- Tab Bay (máy bay)
 local pFly = addTab("Bay", "🚀")
 local flyInfo = infoLabel(pFly, 30)
 toggle(pFly, "Xuyên vật thể khi bay", "NoclipPlane")
@@ -644,14 +892,30 @@ button(pFly, "🔁 Đổi cổng (thử cổng khác)", function()
     notify("Cổng", gates[gateOverride].Name .. " (" .. gateOverride .. "/" .. #gates .. ")")
 end)
 
+-- Tab Người chơi (mới)
+local pPlayer = addTab("Người chơi", "🧍")
+toggle(pPlayer, "Tốc độ chạy", "LoopSpeed")
+stepper(pPlayer, "Tốc độ", "WalkSpeed", 2, 16, 250, 0)
+local flyToggle = toggle(pPlayer, "Bay (nhân vật)", "PFly", function(on)
+    if on then startFly() else stopFly() end
+end)
+stepper(pPlayer, "Tốc độ bay", "PFlySpeed", 0.5, 0.5, 20, 1)
+local noclipToggle = toggle(pPlayer, "Xuyên vật thể (nhân vật)", "Noclip")
+toggle(pPlayer, "Nhảy vô hạn", "InfJump")
+infoLabel(pPlayer, 30).Text = "Phím tắt: F = bay, J = xuyên vật thể, LeftCtrl = ẩn/hiện bảng."
+
 -- Tab Tiện ích
 local pUtil = addTab("Tiện ích", "🧰")
 toggle(pUtil, "Auto thu coin/thưởng", "AutoCollect")
-toggle(pUtil, "Xuyên vật thể (nhân vật)", "Noclip")
+toggle(pUtil, "ESP tên người chơi", "ESP", function(on) if not on then clearESP() end end)
+toggle(pUtil, "FullBright", "FullBright", function(on) if on then applyLight() else restoreLight("bright") end end)
+toggle(pUtil, "Không sương mù", "NoFog", function(on) if on then applyLight() else restoreLight("fog") end end)
 toggle(pUtil, "Làm mờ nền game", "Blur", function(on) blur.Size = on and 14 or 0 end)
 stepper(pUtil, "Độ mờ bảng (0=rõ)", "UIAlpha", 0.05, 0, 0.8, 2, function(v) main.BackgroundTransparency = v end)
 toggle(pUtil, "Spy lệnh Backend (gấp giấy)", "SpyBackend")
-infoLabel(pUtil, 30).Text = "Anti-AFK luôn bật. Bật Spy rồi gấp giấy 1 lần, copy log ở tab Log."
+button(pUtil, "🔄 Rejoin", rejoin)
+button(pUtil, "🌐 Hop server ít người", hopLow)
+infoLabel(pUtil, 30).Text = "Bật Spy rồi gấp giấy 1 lần, copy log ở tab Log."
 
 -- Tab Nhạc
 local pMusic = addTab("Nhạc", "🎵")
@@ -690,7 +954,37 @@ logLabel.AutomaticSize = Enum.AutomaticSize.Y
 button(pLog, "Copy log", function() if setclipboard then setclipboard(table.concat(logs, "\n")) end end)
 button(pLog, "Xóa log", function() logs = {} end)
 
+-- Tab Cài đặt (mới)
+local pSet = addTab("Cài đặt", "⚙")
+toggle(pSet, "Anti AFK", "AntiAFK")
+toggle(pSet, "Tắt phím tắt", "DisableKeybinds")
+toggle(pSet, "Auto Execute khi đổi server", "AutoExecute", function(on) if on then queueAutoExec() end end)
+button(pSet, "💾 Lưu config ngay", function()
+    saveCfg(); notify("Config", canFile and ("Đã lưu " .. SAVE_FILE) or "Executor không hỗ trợ ghi file")
+end)
+button(pSet, "♻ Đặt lại config mặc định", function()
+    for k, v in pairs(DEFAULT_CFG) do CFG[k] = v end
+    saveCfg()
+    notify("Config", "Đã đặt lại. Chạy lại script để áp dụng")
+end, Color3.fromRGB(150, 70, 70))
+infoLabel(pSet, 40).Text = "Config tự lưu mỗi khi đổi. Auto Execute cần điền AUTOEXEC_URL (đầu file) hoặc getgenv().PPHubURL."
+
 selectTab("Auto Ném")
+
+------------------------------------------------------------------
+-- PHÍM TẮT (không chạy khi đang gõ chữ, như HOANGHAI)
+------------------------------------------------------------------
+bind(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if UserInputService:GetFocusedTextBox() then return end
+    if input.KeyCode == Enum.KeyCode.LeftControl then
+        gui.Enabled = not gui.Enabled
+        return
+    end
+    if CFG.DisableKeybinds then return end
+    if input.KeyCode == Enum.KeyCode.F then flyToggle:Set(not CFG.PFly)
+    elseif input.KeyCode == Enum.KeyCode.J then noclipToggle:Set(not CFG.Noclip) end
+end))
 
 ------------------------------------------------------------------
 -- LED + trạng thái
@@ -709,23 +1003,33 @@ end))
 
 task.spawn(function()
     while State.Running do
-        status.Text = ("Ném: %d | Coin +%s | Mã ném: %s | Vị trí: %s"):format(
-            throws, tostring(getCoins() - startCoins), tostring(throwId or "chưa có"),
-            (findZone() and "Khu vực phóng ✓") or (throwSpot and "đã lưu") or "chưa")
-        local pr = inFlight and planeRoot()
-        local dist = ""
-        if pr and curGate and curGate.Parent then
-            local d = curGate.Position - pr.Position
-            dist = (" | còn %d stud"):format(math.floor(Vector3.new(d.X, 0, d.Z).Magnitude))
-        end
-        flyInfo.Text = ("Cổng: %s (%d vật khớp)%s\nTrạng thái: %s"):format(
-            curGate and curGate.Name or "chưa chọn", #gates, dist,
-            reachedGate and "đã chạm cổng" or (inFlight and "đang bay" or "chờ ném"))
-        nowPlaying.Text = "♪ " .. Music.CurrentName .. (MusicSound.Playing and "  (đang phát)" or "  (tạm dừng)")
-        local n, tail = #logs, {}
-        for i = math.max(1, n - 11), n do tail[#tail + 1] = logs[i] end
-        logLabel.Text = table.concat(tail, "\n")
+        pcall(function()
+            status.Text = ("Ném: %d | Coin +%s | Mã ném: %s | Vị trí: %s"):format(
+                throws, tostring(getCoins() - startCoins), tostring(throwId or "chưa có"),
+                (zoneCache and zoneCache.Parent and "Khu vực phóng ✓") or (throwSpot and "đã lưu") or "chưa")
+            local pr = inFlight and planeRoot()
+            local dist = ""
+            if pr and curGate and curGate.Parent then
+                local d = curGate.Position - pr.Position
+                dist = (" | còn %d stud"):format(math.floor(Vector3.new(d.X, 0, d.Z).Magnitude))
+            end
+            flyInfo.Text = ("Cổng: %s (%d vật khớp)%s\nTrạng thái: %s"):format(
+                curGate and curGate.Name or "chưa chọn", #gates, dist,
+                reachedGate and "đã chạm cổng" or (inFlight and "đang bay" or "chờ ném"))
+            nowPlaying.Text = "♪ " .. Music.CurrentName .. (MusicSound.Playing and "  (đang phát)" or "  (tạm dừng)")
+            local n, tail = #logs, {}
+            for i = math.max(1, n - 11), n do tail[#tail + 1] = logs[i] end
+            logLabel.Text = table.concat(tail, "\n")
+        end)
         task.wait(1)
+    end
+end)
+
+-- vị trí ném: nhờ findZone chạy nền để chữ "Khu vực phóng ✓" cập nhật
+task.spawn(function()
+    while State.Running and not (zoneCache and zoneCache.Parent) do
+        findZone()
+        task.wait(3)
     end
 end)
 
@@ -733,6 +1037,10 @@ getgenv().PPHubUnload = function()
     State.Running = false
     inFlight = false
     clearThrust()
+    stopFly()
+    clearESP()
+    if CFG.FullBright then restoreLight("bright") end
+    if CFG.NoFog then restoreLight("fog") end
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     MusicCleanup()
     pcall(function() blur:Destroy() end)
@@ -740,4 +1048,5 @@ getgenv().PPHubUnload = function()
     getgenv().PPHubUnload = nil
 end
 
+if CFG.AutoExecute then queueAutoExec() end
 notify("H-HUB", "Đã tải xong. Ném tay 1 lần để lấy mã ném.")
