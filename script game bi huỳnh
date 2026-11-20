@@ -1,4 +1,4 @@
---// H-HUB | Paper Plane Hub v5.1 (bản hoàn chỉnh, gộp mọi bản sửa)
+--// H-HUB | Paper Plane Hub v5.0 (bản hoàn chỉnh, gộp mọi bản sửa)
 --// So với v4.2:
 --//  * Nhả lực: chụp danh sách % có sẵn TRƯỚC khi bấm, chỉ theo dõi % mới hiện / đổi sau khi bấm,
 --//    quét liên tục khi giữ, sửa chiều chỉnh Lead (thiếu lực -> nhả muộn hơn), Lead tối đa 0.15
@@ -878,14 +878,24 @@ do
     end
 
     -- trả về kết quả cast đầu tiên là vật chắn THẬT (bỏ qua kẹo/coin/cổng/trong suốt rồi cast tiếp)
-    function blockingHit(origin, vec, radius)
+    function blockingHit(origin, vec, radius, planeBottom)
         local filt
-        for _ = 1, 4 do
+        for _ = 1, 12 do
             local res = cast(origin, vec, radius)
             if not res then break end
             local i = res.Instance
-            local ghost = (not i:IsA("Terrain")) and
-                (i == curGate or i.Transparency >= 0.95 or not (i.CanCollide or i.CanTouch) or isIgnoredName(i))
+            local lowEnough = false
+            -- Vật có đỉnh thấp hơn đáy máy bay không phải vật cản: bỏ qua để bay thẳng.
+            if planeBottom and i:IsA("BasePart") then
+                local cf, sz = i.CFrame, i.Size
+                local halfY = math.abs(cf.RightVector.Y) * sz.X * 0.5
+                    + math.abs(cf.UpVector.Y) * sz.Y * 0.5
+                    + math.abs(cf.LookVector.Y) * sz.Z * 0.5
+                local topY = i.Position.Y + halfY
+                lowEnough = topY <= planeBottom - 0.75
+            end
+            local ghost = lowEnough or ((not i:IsA("Terrain")) and
+                (i == curGate or i.Transparency >= 0.95 or not (i.CanCollide or i.CanTouch) or isIgnoredName(i)))
             if not ghost then
                 if filt then avoidParams.FilterDescendantsInstances = DG.base end
                 return res
@@ -907,7 +917,7 @@ do
         return math.abs(offs[to]), false
     end
 
-    function updateDodge(pos, dir, speed)
+    function updateDodge(pos, dir, speed, plane)
         if not CFG.AvoidObstacles then DG.dir, DG.lat, DG.climb = 0, 0, 0; return 0 end
         local now = os.clock()
         if now - DG.lastScan < CFG.ScanRate then return DG.dir end
@@ -916,10 +926,21 @@ do
         local R = CFG.PlaneRadius
         local c = R + 3
         local side = Vector3.new(-dir.Z, 0, dir.X)
+        -- Tính đáy máy bay theo kích thước và góc nghiêng hiện tại, không chỉ lấy Size.Y.
+        local planeBottom = pos.Y
+        if plane and plane:IsA("BasePart") then
+            local cf, sz = plane.CFrame, plane.Size
+            local halfY = math.abs(cf.RightVector.Y) * sz.X * 0.5
+                + math.abs(cf.UpVector.Y) * sz.Y * 0.5
+                + math.abs(cf.LookVector.Y) * sz.Z * 0.5
+            planeBottom = pos.Y - halfY
+        else
+            planeBottom = pos.Y - R
+        end
         local offs, free = {}, {}
         for i, k in ipairs(LANES) do
             offs[i] = k * c
-            local res = blockingHit(pos + side * offs[i], dir * look, R)
+            local res = blockingHit(pos + side * offs[i], dir * look, R, planeBottom)
             free[i] = res and res.Distance or look
         end
         local ahead = math.min(free[3], free[4], free[5])
@@ -928,23 +949,37 @@ do
             local shR, clearR = laneShift(free, offs, 5, 7, 1, look)
             local shL, clearL = laneShift(free, offs, 3, 1, -1, look)
             local sl, sr = free[1] + free[2] + free[3], free[5] + free[6] + free[7]
-            local pick
-            if clearR ~= clearL then pick = clearR and 1 or -1
-            elseif DG.dir == 0 then pick = (sr >= sl) and 1 or -1
-            elseif DG.dir == 1 then pick = (sr * 1.25 >= sl) and 1 or -1
-            else pick = (sl * 1.25 >= sr) and -1 or 1 end
-            if DG.dir == 0 then
+            local candidate
+            if clearR ~= clearL then candidate = clearR and 1 or -1
+            else candidate = (sr >= sl) and 1 or -1 end
+            -- Chống đảo lái: giữ bên đang né; chỉ đổi nếu bên kia thoáng hơn đáng kể.
+            local pick = candidate
+            if DG.dir ~= 0 and now < DG.untilT then
+                local currentScore = DG.dir > 0 and sr or sl
+                local otherScore = DG.dir > 0 and sl or sr
+                if otherScore < currentScore + math.max(look * 0.35, 35) then
+                    pick = DG.dir
+                else
+                    pick = candidate
+                end
+            elseif DG.dir ~= 0 then
+                -- Hết khóa hướng: chỉ đổi bên nếu hướng cũ không còn lối thoát.
+                local oldClear = DG.dir > 0 and clearR or clearL
+                if oldClear then pick = DG.dir end
+            end
+            if DG.dir == 0 or pick ~= DG.dir then
                 log(("[NÉ] vật cản cách %d stud (quét %d) -> lái %s"):format(
                     math.floor(ahead), math.floor(look), pick > 0 and "phải" or "trái"))
+                DG.untilT = now + 0.9
             end
             DG.dir = pick
-            DG.untilT = now + 0.45
-            -- tốc độ đẩy ngang đủ để dịch ra khỏi làn bị chặn trước khi tới vật cản
             local shift = (pick == 1) and shR or shL
-            DG.lat = math.clamp(shift * speed / math.max(ahead - R, 10) * 1.3, 15, CFG.DodgeSide)
-            DG.climb = (not clearR and not clearL) and 1 or 0 -- kín cả 2 bên -> bay cao lên
+            -- Giới hạn và làm mượt lực né để tránh giật ngang/đánh lái liên tục.
+            local wantedLat = math.clamp(shift * speed / math.max(ahead - R, 18) * 0.75, 12, math.min(CFG.DodgeSide, 65))
+            DG.lat = DG.lat == 0 and wantedLat or (DG.lat * 0.65 + wantedLat * 0.35)
+            DG.climb = (not clearR and not clearL) and 1 or 0
         else
-            DG.lat = DG.lat * 0.7
+            DG.lat = DG.lat * 0.55
             if now > DG.untilT then DG.dir, DG.lat, DG.climb = 0, 0, 0 end
         end
         return DG.dir
@@ -1295,7 +1330,7 @@ local function flightStep()
     end
     -- dùng tốc độ thực đo được (khi đang dịch CFrame thì vận tốc không phản ánh đúng)
     local sp = math.max(speed, State.actual or 0)
-    local d = updateDodge(pos, dir, sp)
+    local d = updateDodge(pos, dir, sp, r)
     local c = (d == 0) and updateCandy(pos, dir) or 0
     setSteer(d ~= 0 and d or c)
 
@@ -1387,53 +1422,119 @@ local function findUnlocks()
 end
 
 local farmStatus, lastUnlockCheck, lastUnlockPart, lastUnlockTime = "tắt", 0, nil, 0
-local x2Clicked = setmetatable({}, {__mode = "k"})
-local function unlockBest(force)
-    local list = findUnlocks()
-    local u = list[1]
-    if not u or not u.part or not u.part.Parent then
-        farmStatus = "không thấy khu vực 'Mở khóa' có hệ số"
-        return nil, list
+local x2ClickState = setmetatable({}, {__mode = "k"})
+
+local function cleanGuiText(value)
+    value = tostring(value or ""):gsub("<[^>]->", ""):lower()
+    value = value:gsub("%s+", " ")
+    return value
+end
+
+local function isX2StrengthText(value)
+    local t = cleanGuiText(value)
+    -- Nhận cả cách viết có/không dấu và các cách đảo vị trí thường gặp.
+    local strength = t:find("x2 sức mạnh", 1, true)
+        or t:find("x2 suc manh", 1, true)
+        or t:find("sức mạnh x2", 1, true)
+        or t:find("suc manh x2", 1, true)
+        or t:find("2x sức mạnh", 1, true)
+        or t:find("2x suc manh", 1, true)
+    local power = t:find("x2 power", 1, true) or t:find("2x power", 1, true)
+    return strength ~= nil and power == nil
+end
+
+local function guiTextTree(obj, depth)
+    local out, seen = {}, 0
+    if not obj then return "" end
+    local function addText(o)
+        if o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox") then
+            out[#out + 1] = o.Text
+        end
+        out[#out + 1] = o.Name
     end
-    local r = root()
-    if not r then return nil, list end
-    local key = u.part
-    farmStatus = ("Đã chọn khu vực %s (x%s)"):format(u.name, tostring(u.mult))
-    if force or key ~= lastUnlockPart or os.clock() - lastUnlockTime > 30 then
-        lastUnlockPart, lastUnlockTime = key, os.clock()
-        local cf = u.part.CFrame + Vector3.new(0, u.part.Size.Y / 2 + 3, 0)
-        r.CFrame = cf
-        log(("[FAM] chọn khu vực %s (x%s), đã teleport"):format(u.name, tostring(u.mult)))
+    addText(obj)
+    local ok, descendants = pcall(function() return obj:GetDescendants() end)
+    if ok then
+        for _, child in ipairs(descendants) do
+            if seen >= 60 then break end
+            if child:IsA("GuiObject") and child.Visible then
+                addText(child)
+                seen += 1
+            end
+        end
     end
-    return u, list
+    return cleanGuiText(table.concat(out, " "))
+end
+
+local function circleClickTarget(labelObj)
+    -- Ưu tiên nút bấm thật; nếu chữ nằm đè trên ImageLabel/Frame hình tròn,
+    -- tìm tổ tiên gần nhất có kích thước gần vuông để bấm đúng tâm vòng tròn.
+    local p, best, bestScore = labelObj, nil, math.huge
+    local depth = 0
+    while p and p:IsA("GuiObject") and depth < 7 do
+        local size = p.AbsoluteSize
+        if size.X >= 24 and size.Y >= 24 and size.X <= 360 and size.Y <= 360 then
+            local ratio = size.X / math.max(size.Y, 1)
+            local squareError = math.abs(1 - ratio)
+            if p:IsA("GuiButton") then
+                return p
+            end
+            if squareError <= 0.38 then
+                local score = squareError * 100 + depth * 0.5
+                if score < bestScore then best, bestScore = p, score end
+            end
+        end
+        p = p.Parent
+        depth += 1
+    end
+    return best or labelObj
 end
 
 local function clickX2Strength()
     local pg = lp:FindFirstChildOfClass("PlayerGui")
     if not pg then return end
-    for btn in pairs(x2Clicked) do
-        if not btn.Parent or not visibleChain(btn) then x2Clicked[btn] = nil end
+
+    -- Xóa trạng thái khi vòng tròn/nút đã biến mất hoặc bị ẩn để lần xuất hiện sau được nhấn lại.
+    for obj in pairs(x2ClickState) do
+        if not obj.Parent or not visibleChain(obj) then x2ClickState[obj] = nil end
     end
+
     for _, v in ipairs(pg:GetDescendants()) do
-        if (v:IsA("TextButton") or v:IsA("TextLabel")) and visibleChain(v) then
-            local btn = v:IsA("GuiButton") and v or v:FindFirstAncestorWhichIsA("GuiButton")
-            local label = (v.Text .. " " .. v.Name):lower():gsub("<[^>]->", "")
-            local isStrength = label:find("x2 sức mạnh", 1, true) or label:find("x2 suc manh", 1, true)
-            local isPower = label:find("x2 power", 1, true)
-            if btn and isStrength and not isPower and visibleChain(btn) and not x2Clicked[btn] then
-                local fullLabel = (btn.Name .. " " .. (btn:IsA("TextButton") and btn.Text or "")):lower()
-                if not fullLabel:find("x2 power", 1, true) then
-                    x2Clicked[btn] = true
-                    local fired = false
-                    if type(getconnections) == "function" then
-                        local ok = pcall(function()
-                            for _, c in ipairs(getconnections(btn.Activated)) do c:Fire(); fired = true end
-                        end)
-                        if not ok then fired = false end
+        if v:IsA("GuiObject") and visibleChain(v) then
+            local directText = ""
+            if v:IsA("TextLabel") or v:IsA("TextButton") or v:IsA("TextBox") then
+                directText = cleanGuiText(v.Text .. " " .. v.Name)
+            else
+                directText = cleanGuiText(v.Name)
+            end
+
+            local hasTarget = isX2StrengthText(directText)
+            -- Một số UI đặt chữ ở ngoài vòng tròn hoặc tách thành nhiều TextLabel,
+            -- vì vậy kiểm tra thêm cây GUI của Frame/ImageButton bao quanh.
+            if not hasTarget and (v:IsA("Frame") or v:IsA("ImageButton") or v:IsA("ImageLabel") or v:IsA("TextButton")) then
+                hasTarget = isX2StrengthText(guiTextTree(v, 2))
+            end
+
+            if hasTarget then
+                local hit = circleClickTarget(v)
+                if hit and hit.Parent and visibleChain(hit) then
+                    local state = x2ClickState[hit]
+                    if not state then state = {tries = 0, last = 0}; x2ClickState[hit] = state end
+                    if state.tries < 3 and os.clock() - state.last >= 0.85 then
+                        local size, pos = hit.AbsoluteSize, hit.AbsolutePosition
+                        if size.X > 0 and size.Y > 0 then
+                            local x, y = pos.X + size.X * 0.5, pos.Y + size.Y * 0.5
+                            -- Dùng cùng đường giả lập chuột với Auto Ném; nhấn và nhả ngay tại tâm vòng tròn.
+                            pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
+                            mouseBtn(x, y, true)
+                            task.wait(0.055)
+                            mouseBtn(x, y, false)
+                            state.tries += 1
+                            state.last = os.clock()
+                            log(("[FARM] click vòng tròn x2 sức mạnh (%d/3)"):format(state.tries))
+                            return
+                        end
                     end
-                    if not fired then pcall(function() btn:Activate() end) end
-                    log("[FAM] đã nhấn x2 sức mạnh")
-                    return
                 end
             end
         end
@@ -1455,7 +1556,7 @@ local function farmTick()
             end
         end
     end
-    pcall(clickX2Strength) -- chỉ nhấn x2 sức mạnh; tuyệt đối bỏ qua x2 Power
+    pcall(clickX2Strength) -- click tâm vòng tròn x2 sức mạnh bằng cùng cơ chế Auto Ném; bỏ qua x2 Power
 end
 
 ------------------------------------------------------------------
