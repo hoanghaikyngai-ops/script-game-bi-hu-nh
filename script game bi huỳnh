@@ -45,8 +45,9 @@ local CFG = {
     AntiAFK = true, AutoExecute = false, DisableKeybinds = false,
     AvoidObstacles = true, TeleRadius = 15, StillTime = 1.5, GateWait = 15,
     PowerGoal = 1, Lead = 0.05, AutoLead = true, MaxCharge = 10, ClickOffY = 0, LandTap = true,
-    ScanDist = 5, ScanTime = 0.4, SteerKeys = 1, SteerInvert = false, SteerRemote = false,
-    SpeedBoost = true, SpeedMult = 4,
+    ScanDist = 30, ScanTime = 0.9, SteerKeys = 1, SteerInvert = false, SteerRemote = false,
+    SpeedBoost = true, SpeedMult = 5,
+    DodgeAssist = true, DodgeSide = 250, PlaneRadius = 6, ScanRate = 0.03, SpeedMode = 0, CfgVer = 0,
     AutoCandy = true, CandyLateral = 90, CandyAhead = 400, CandyHeight = 25, CandyDead = 5,
     FarmPower = false, FarmTime = 8,
     AutoRebirth = false, RebirthEvery = 5,
@@ -83,7 +84,11 @@ end)
 CFG.AutoThrow = false -- không tự bật khi vừa chạy
 CFG.FarmPower = false
 CFG.AutoRebirth = false
-if CFG.Lead > 0.15 or CFG.Lead < 0 then CFG.Lead = 0.05 end -- xóa giá trị Lead bị kẹt của bản cũ
+if (CFG.CfgVer or 0) < 51 then
+    CFG.ScanDist, CFG.ScanTime, CFG.SpeedMult, CFG.Lead = 30, 0.9, 5, 0.06
+    CFG.CfgVer = 51
+end
+if CFG.Lead > 0.25 or CFG.Lead < 0 then CFG.Lead = 0.06 end
 
 local function new(cls, props, parent)
     local o = Instance.new(cls)
@@ -372,7 +377,8 @@ end
 local function readObj(o)
     if not (o and o.Parent) then return nil end
     if o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox") then
-        local n = tonumber(o.Text:match("(%d+%.?%d*)%s*%%"))
+        local txt = (o.Text:gsub("<[^>]->", "")):gsub(",", ".")
+        local n = tonumber(txt:match("(%d+%.?%d*)%s*%%"))
         return n and n / 100 or nil
     end
     if o:IsA("GuiObject") then
@@ -413,7 +419,7 @@ bind(UserInputService.InputBegan:Connect(function(input)
     end
     chosen = chosen or objs[1]
     if chosen then
-        meterObj, pickMode = chosen, false
+        meterObj, pickMode, State.meterLearned = chosen, false, false
         notify("Thanh lực", "Đã chọn: " .. chosen.Name)
     else
         notify("Thanh lực", "Không có GUI ở chỗ bấm, thử lại")
@@ -428,156 +434,222 @@ local function tapScreen()
     mouseBtn(x, y, false)
 end
 
--- Theo dõi các "xx%" MỚI hiện / đổi chữ sau khi bấm (không nhận % có sẵn trước khi bấm)
-local function newTracker()
-    local T = {items = {}, ignored = setmetatable({}, {__mode = "k"}),
-        base = setmetatable({}, {__mode = "k"}), lastScan = -10}
-    function T:snapshot()
-        local pg = lp:FindFirstChildOfClass("PlayerGui")
-        if not pg then return end
-        for _, o in ipairs(pg:GetDescendants()) do
-            if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text:find("%d%s*%%") and visibleChain(o) then
-                self.base[o] = o.Text
+local holdThrow
+do
+    local function pctOnly(t)
+        t = (tostring(t):gsub("<[^>]->", ""))
+        return t:match("^%s*%d+[%.,]?%d*%s*%%%s*$") ~= nil
+    end
+
+    local function newTracker()
+        local T = {items = {}, ignored = setmetatable({}, {__mode = "k"}),
+            base = setmetatable({}, {__mode = "k"}), lastScan = -10}
+        local function isPctLabel(o)
+            return (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text:find("%d%s*%%") ~= nil and visibleChain(o)
+        end
+        function T:snapshot()
+            local pg = lp:FindFirstChildOfClass("PlayerGui")
+            if not pg then return end
+            for _, o in ipairs(pg:GetDescendants()) do
+                if isPctLabel(o) then self.base[o] = o.Text end
             end
         end
-    end
-    function T:scan(now)
-        local pg = lp:FindFirstChildOfClass("PlayerGui")
-        if not pg then return end
-        self.lastScan = now
-        for _, o in ipairs(pg:GetDescendants()) do
-            if (o:IsA("TextLabel") or o:IsA("TextButton")) and not self.items[o] and not self.ignored[o] then
-                if o.Text:find("%d%s*%%") and visibleChain(o) then
+        function T:scan(now)
+            local pg = lp:FindFirstChildOfClass("PlayerGui")
+            if not pg then return end
+            self.lastScan = now
+            for _, o in ipairs(pg:GetDescendants()) do
+                if not self.items[o] and not self.ignored[o] and isPctLabel(o) then
                     if self.base[o] == nil or self.base[o] ~= o.Text then
-                        self.items[o] = {v = readObj(o), born = now, tChange = nil, n = 0, hist = {}}
+                        self.items[o] = {v = readObj(o), born = now, n = 0, hist = {}, lo = 9, hi = -9, pure = pctOnly(o.Text)}
                     end
                 end
             end
         end
-    end
-    function T:update(now)
-        for o, s in pairs(self.items) do
-            if not o.Parent then
-                self.items[o] = nil
-            else
-                local v = readObj(o)
-                if v and s.v and math.abs(v - s.v) > 1e-4 then
-                    s.n += 1
-                    s.tChange = now
-                    local h = s.hist
-                    h[#h + 1] = {now, v}
-                    if #h > 6 then table.remove(h, 1) end
-                end
-                if v then s.v = v end
-                if not s.manual and now - (s.tChange or s.born) > 1.5 then
+        function T:update(now)
+            for o, s in pairs(self.items) do
+                if not o.Parent then
                     self.items[o] = nil
-                    self.ignored[o] = true
+                else
+                    local v = readObj(o)
+                    if v then
+                        if s.v and math.abs(v - s.v) > 1e-4 then
+                            s.n += 1
+                            s.tChange = now
+                            local h = s.hist
+                            h[#h + 1] = {now, v}
+                            if #h > 12 then table.remove(h, 1) end
+                        end
+                        if v < s.lo then s.lo = v end
+                        if v > s.hi then s.hi = v end
+                        s.v = v
+                    end
+                    -- nhãn đổi < 4 lần rồi đứng yên 1.5s = không phải thanh lực
+                    if not s.manual and s.n < 4 and now - (s.tChange or s.born) > 1.5 then
+                        self.items[o] = nil
+                        self.ignored[o] = true
+                    end
                 end
             end
         end
+        -- Chấm điểm: số lần đổi + biên độ (thanh lực chạy 0->100%) + chỉ có "xx%" + tên gợi ý
+        function T:best()
+            local bo, bs, bscore
+            for o, s in pairs(self.items) do
+                if s.n >= 1 or s.manual then
+                    local range = (s.hi >= s.lo) and (s.hi - s.lo) or 0
+                    local score = math.min(s.n, 30) + range * 40 + (s.pure and 8 or 0)
+                        + (nameHas(o) and 3 or 0) + (s.manual and 100 or 0)
+                    if not bscore or score > bscore then bo, bs, bscore = o, s, score end
+                end
+            end
+            return bs, bo
+        end
+        return T
     end
-    function T:best()
-        local bo, bs, bscore
-        for o, s in pairs(self.items) do
+
+    -- tốc độ đổi (đơn vị 1.0 = 100%) tính trên cửa sổ ~0.18s gần nhất
+    local function rateOf(s)
+        local h = s.hist
+        local n = #h
+        if n < 2 then return 0 end
+        local b = h[n]
+        local a = b
+        for i = n - 1, 1, -1 do
+            if b[1] - h[i][1] > 0.18 then break end
+            a = h[i]
+        end
+        local dt = b[1] - a[1]
+        if dt < 0.03 then a = h[n - 1]; dt = b[1] - a[1] end
+        if dt <= 0 then return 0 end
+        return (b[2] - a[2]) / dt
+    end
+
+    local function dumpCand(T)
+        local rows = {}
+        for o, s in pairs(T.items) do
             if s.n >= 1 or s.manual then
-                local score = s.n + (nameHas(o) and 5 or 0) + (s.manual and 100 or 0)
-                if not bscore or score > bscore then bo, bs, bscore = o, s, score end
+                local ok = s.hi >= s.lo
+                rows[#rows + 1] = ("%s.%s n=%d %.0f-%.0f%%"):format(o.Parent and o.Parent.Name or "?", o.Name,
+                    s.n, (ok and s.lo or 0) * 100, (ok and s.hi or 0) * 100)
             end
         end
-        return bs, bo
+        table.sort(rows)
+        return table.concat(rows, " | ", 1, math.min(#rows, 4))
     end
-    return T
-end
 
-local function rateOf(s)
-    local h = s.hist
-    if #h < 2 then return 0 end
-    local a, b = h[1], h[#h]
-    local dt = b[1] - a[1]
-    if dt <= 0 then return 0 end
-    return (b[2] - a[2]) / dt
-end
+    function holdThrow(manual)
+        local T = newTracker()
+        local t00 = os.clock()
+        T:snapshot() -- chụp mọi % đang hiện sẵn TRƯỚC khi bấm
+        if meterObj and meterObj.Parent then
+            T.items[meterObj] = {v = readObj(meterObj), born = t00, n = 0, hist = {}, lo = 9, hi = -9, manual = true}
+        end
+        local x, y = pickClickPoint()
+        pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
+        local t0 = os.clock()
+        mouseBtn(x, y, true)
+        local goal = CFG.PowerGoal
+        local lead = math.clamp(CFG.Lead, 0, 0.25)
+        local released, active, activeS, vRel, lastV, rateRel = false, nil, nil, nil, nil, 0
+        local fdt = 1 / 60
 
--- Giữ chuột, đoán trước rồi thả đúng 100%
-local function holdThrow(manual)
-    local T = newTracker()
-    local t00 = os.clock()
-    T:snapshot() -- chụp mọi % đang hiện sẵn TRƯỚC khi bấm
-    if meterObj and meterObj.Parent then
-        T.items[meterObj] = {v = readObj(meterObj), born = t00, n = 0, hist = {}, manual = true}
-    end
-    local x, y = pickClickPoint()
-    pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
-    local t0 = os.clock()
-    mouseBtn(x, y, true)
-    local goal = CFG.PowerGoal
-    local lead = math.clamp(CFG.Lead, 0, 0.15)
-    local released, active, vRel, lastV = false, nil, nil, nil
+        while State.Running and (CFG.AutoThrow or manual) do
+            local now = os.clock()
+            local el = now - t0
+            if now - T.lastScan > 0.08 then T:scan(now) end
+            T:update(now)
 
-    while State.Running and (CFG.AutoThrow or manual) do
-        local now = os.clock()
-        local el = now - t0
-        if now - T.lastScan > 0.12 then T:scan(now) end
-        T:update(now)
-        local s, o = T:best()
-        if s and s.v then
-            active = o
-            lastV, lastPower, lastMeterName = s.v, s.v, o.Name
-            local trusted = s.manual or s.n >= 2
-            if trusted and el > 0.1 then
-                local rate = (s.n >= 3) and rateOf(s) or 0
-                local pred = s.v
-                if rate > 0 and rate < 4 and s.v >= 0.5 then pred = s.v + rate * lead end
-                if s.v >= goal - 0.002 or pred >= goal - 0.002 then
-                    released, vRel = true, s.v
-                    break
+            -- thanh lực đã học mà không hề đổi -> bỏ, dò lại
+            if State.meterLearned and meterObj and el > 1.2 then
+                local it = T.items[meterObj]
+                if it and it.n == 0 then
+                    T.items[meterObj] = nil
+                    meterObj, State.meterLearned = nil, false
+                    log("[LỰC] thanh lực đã học không đổi -> bỏ, dò lại")
                 end
             end
-        end
-        if el >= CFG.MaxCharge then break end
-        if (not s) and el >= math.max(CFG.ChargeHold, 2) then break end
-        RunService.RenderStepped:Wait()
-    end
-    mouseBtn(x, y, false)
-    local tUp = os.clock()
 
-    local finalV, lastChange = lastV, nil
-    if released and active and active.Parent then
-        local lastVal = vRel
-        local t1 = os.clock()
-        while os.clock() - t1 < 0.45 do
-            RunService.RenderStepped:Wait()
-            local v = readObj(active)
-            if v then
-                if lastVal and math.abs(v - lastVal) > 1e-4 then lastChange = os.clock() end
-                lastVal, finalV = v, v
+            local s, o = T:best()
+            if s and s.v then
+                active, activeS = o, s
+                lastV, lastPower, lastMeterName = s.v, s.v, o.Name
+                local trusted = s.manual or s.n >= 3
+                if trusted and el > 0.05 then
+                    local rate = rateOf(s)
+                    local rising = rate > 0.05 and rate < 12
+                    if s.v >= goal - 0.002 then
+                        released, vRel, rateRel = true, s.v, rate
+                        break
+                    elseif rising and s.v >= 0.6 then
+                        -- đang tăng: đoán trước độ trễ bấm-thả, thả ở khung hình gần 100% nhất
+                        local pred = s.v + rate * lead
+                        if pred >= goal - rate * fdt * 0.5 then
+                            released, vRel, rateRel = true, s.v, rate
+                            break
+                        end
+                    end
+                    -- đang giảm (vòng đã qua đỉnh) -> không thả, đợi vòng sau
+                end
             end
-            if lastChange and os.clock() - lastChange > 0.12 then break end
-            if (not lastChange) and os.clock() - t1 > 0.15 then break end
+            if el >= CFG.MaxCharge then break end
+            if (not s) and el >= math.max(CFG.ChargeHold, 2) then break end
+            fdt = fdt * 0.9 + RunService.RenderStepped:Wait() * 0.1
         end
-        if CFG.AutoLead and finalV and finalV >= 0.3 then
-            local newLead = CFG.Lead
-            if finalV < goal - 0.015 then
-                newLead = newLead - 0.015 -- thiếu lực -> nhả MUỘN hơn
-            elseif lastChange then
-                local L = lastChange - tUp
-                if L > 0.005 and L < 0.15 then newLead = CFG.Lead * 0.7 + L * 0.3 end
-            end
-            newLead = math.clamp(newLead, 0, 0.15)
-            if math.abs(newLead - CFG.Lead) > 0.001 then CFG.Lead = newLead; saveCfg() end
-        end
-    end
+        mouseBtn(x, y, false)
+        local tUp = os.clock()
 
-    if released then
-        log(("[THROW] thả ở %.0f%%, lực cuối %.0f%%, đoán trước %.0fms"):format(
-            (vRel or 0) * 100, (finalV or 0) * 100, CFG.Lead * 1000))
-    elseif lastV then
-        log(("[THROW] hết giờ giữ, lực cuối %.0f%%"):format(lastV * 100))
-    else
-        log("[THROW] không thấy % nào đang đổi -> dùng nút 'Chọn thanh lực'")
+        local finalV, lastChange = lastV, nil
+        if released and active and active.Parent then
+            local lastVal = vRel
+            local t1 = os.clock()
+            while os.clock() - t1 < 0.5 do
+                RunService.RenderStepped:Wait()
+                local v = readObj(active)
+                if v then
+                    if lastVal and v < lastVal - 0.25 then break end -- bị reset về 0 sau khi thả
+                    if lastVal and math.abs(v - lastVal) > 1e-4 then lastChange = os.clock() end
+                    lastVal, finalV = v, v
+                end
+                if lastChange and os.clock() - lastChange > 0.12 then break end
+                if (not lastChange) and os.clock() - t1 > 0.15 then break end
+            end
+
+            if CFG.AutoLead and finalV and finalV >= 0.3 and rateRel > 0.3 then
+                local newLead = CFG.Lead
+                if lastChange then
+                    -- từ lúc thả tới lúc số ngừng đổi = độ trễ thật
+                    local L = lastChange - tUp
+                    if L > 0.003 and L < 0.25 then newLead = CFG.Lead * 0.6 + L * 0.4 end
+                elseif finalV < goal - 0.02 then
+                    newLead = newLead - 0.01
+                end
+                newLead = math.clamp(newLead, 0, 0.25)
+                if math.abs(newLead - CFG.Lead) > 0.001 then CFG.Lead = newLead; saveCfg() end
+            end
+        end
+
+        -- tự học thanh lực: nhãn đổi >= 6 lần và chạy rộng >= 40% -> nhớ lại cho các lượt sau
+        if released and active and activeS and active.Parent and (not meterObj or State.meterLearned)
+            and activeS.n >= 6 and (activeS.hi - activeS.lo) >= 0.4 then
+            if meterObj ~= active then log("[LỰC] đã học thanh lực: " .. active:GetFullName()) end
+            meterObj, State.meterLearned = active, true
+        end
+
+        if released then
+            log(("[THROW] thả ở %.0f%% (tốc %.1f/s), lực cuối %.0f%%, đoán trước %.0fms | %s"):format(
+                (vRel or 0) * 100, rateRel, (finalV or 0) * 100, CFG.Lead * 1000, dumpCand(T)))
+        elseif lastV then
+            log(("[THROW] hết giờ giữ, lực cuối %.0f%% | %s"):format(lastV * 100, dumpCand(T)))
+        else
+            log("[THROW] không thấy % nào đang đổi -> dùng nút 'Chọn thanh lực'")
+        end
+        return released
     end
-    return released
 end
+
+-- Khi người dùng tự chọn thanh lực (trong InputBegan, chỗ  meterObj, pickMode, State.meterLearned = chosen, false, false)
+-- đổi thành:   meterObj, pickMode, State.meterLearned = chosen, false, false
 
 ------------------------------------------------------------------
 -- MÁY BAY (chỉ nhận máy bay CỦA MÌNH)
@@ -652,7 +724,10 @@ do
         planeCache = nil
         if os.clock() - lastPlaneScan < 0.3 then return nil end
         lastPlaneScan = os.clock()
-        local best, bestD
+        local best, bestD, fast, fastV
+        local rr = root()
+        local allowFast = rr and (os.clock() - throwStartT) > 0.8
+            and (#Players:GetPlayers() <= 1 or type(isnetworkowner) == "function")
         for _, v in ipairs(workspace:GetDescendants()) do
             if (v:IsA("Model") or v:IsA("BasePart")) and not (lp.Character and v:IsDescendantOf(lp.Character)) then
                 if isMine(v) then
@@ -665,10 +740,29 @@ do
                         if not bestD or si.d < bestD then best, bestD = v, si.d end
                     end
                 end
+                if allowFast and v:IsA("BasePart") and not v.Anchored then
+                    local sp = v.AssemblyLinearVelocity.Magnitude
+                    if sp > 25 and (not fastV or sp > fastV) and (v.Position - rr.Position).Magnitude < 400 then
+                        local okOwn = true
+                        if type(isnetworkowner) == "function" then
+                            local ok2, res = pcall(isnetworkowner, v)
+                            okOwn = ok2 and res
+                        end
+                        if okOwn and not ownedByOther(v) then fast, fastV = v, sp end
+                    end
+                end
             end
         end
-        if best then planeCache = best; log("[BAY] nhận máy bay của mình: " .. best:GetFullName()) end
-        return best
+        if best then
+            planeCache = best
+            log("[BAY] nhận máy bay của mình: " .. best:GetFullName())
+            return best
+        elseif fast then
+            planeCache = fast
+            log("[BAY] không thấy tên 'plane' -> lấy vật bay nhanh nhất của mình: " .. fast:GetFullName())
+            return fast
+        end
+        return nil
     end
 end
 
@@ -745,6 +839,7 @@ end
 local avoidParams = RaycastParams.new()
 avoidParams.FilterType = Enum.RaycastFilterType.Exclude
 avoidParams.IgnoreWater = true
+local DG = {dir = 0, untilT = 0, lat = 0, ahead = nil, climb = 0, lastScan = 0, base = {}}
 
 local function refreshAvoidFilter()
     local list = {}
@@ -753,10 +848,11 @@ local function refreshAvoidFilter()
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= lp and p.Character then list[#list + 1] = p.Character end
     end
+    DG.base = list
     avoidParams.FilterDescendantsInstances = list
 end
 
-local blockingHit
+local blockingHit, updateDodge
 do
     local IGN = {"candy", "kẹo", "lolli", "sweet", "sugar", "coin", "gate", "cổng", "finish"}
     local function isIgnoredName(i)
@@ -767,20 +863,93 @@ do
         end
         return false
     end
-    function blockingHit(origin, vec)
-        local res = workspace:Raycast(origin, vec, avoidParams)
-        local i = res and res.Instance
-        if i and i ~= curGate and i.Transparency < 0.95 and (i.CanCollide or i.CanTouch) and not isIgnoredName(i) then
-            return res
+
+    local function cast(origin, vec, radius)
+        if radius and radius > 0.5 then
+            local ok, res = pcall(function() return workspace:Spherecast(origin, radius, vec, avoidParams) end)
+            if ok then
+                if res and res.Distance < 1.5 and res.Normal.Y > 0.5 then
+                    return workspace:Raycast(origin, vec, avoidParams) -- đang sát sàn: chỉ dùng tia mảnh
+                end
+                return res
+            end
         end
+        return workspace:Raycast(origin, vec, avoidParams)
+    end
+
+    -- trả về kết quả cast đầu tiên là vật chắn THẬT (bỏ qua kẹo/coin/cổng/trong suốt rồi cast tiếp)
+    function blockingHit(origin, vec, radius)
+        local filt
+        for _ = 1, 4 do
+            local res = cast(origin, vec, radius)
+            if not res then break end
+            local i = res.Instance
+            local ghost = (not i:IsA("Terrain")) and
+                (i == curGate or i.Transparency >= 0.95 or not (i.CanCollide or i.CanTouch) or isIgnoredName(i))
+            if not ghost then
+                if filt then avoidParams.FilterDescendantsInstances = DG.base end
+                return res
+            end
+            filt = filt or table.clone(DG.base)
+            filt[#filt + 1] = i
+            avoidParams.FilterDescendantsInstances = filt
+        end
+        if filt then avoidParams.FilterDescendantsInstances = DG.base end
+        return nil
+    end
+
+    -- 7 làn song song phía trước (cách nhau theo bề ngang máy bay), mỗi làn là 1 spherecast
+    local LANES = {-4, -2.2, -1, 0, 1, 2.2, 4}
+    local function laneShift(free, offs, from, to, step, look)
+        for j = from, to, step do
+            if free[j] >= look - 1 then return math.abs(offs[j]), true end
+        end
+        return math.abs(offs[to]), false
+    end
+
+    function updateDodge(pos, dir, speed)
+        if not CFG.AvoidObstacles then DG.dir, DG.lat, DG.climb = 0, 0, 0; return 0 end
+        local now = os.clock()
+        if now - DG.lastScan < CFG.ScanRate then return DG.dir end
+        DG.lastScan = now
+        local look = math.clamp(CFG.ScanDist + speed * CFG.ScanTime, 25, 1000)
+        local R = CFG.PlaneRadius
+        local c = R + 3
+        local side = Vector3.new(-dir.Z, 0, dir.X)
+        local offs, free = {}, {}
+        for i, k in ipairs(LANES) do
+            offs[i] = k * c
+            local res = blockingHit(pos + side * offs[i], dir * look, R)
+            free[i] = res and res.Distance or look
+        end
+        local ahead = math.min(free[3], free[4], free[5])
+        DG.ahead = ahead
+        if ahead < look - 1 then
+            local shR, clearR = laneShift(free, offs, 5, 7, 1, look)
+            local shL, clearL = laneShift(free, offs, 3, 1, -1, look)
+            local sl, sr = free[1] + free[2] + free[3], free[5] + free[6] + free[7]
+            local pick
+            if clearR ~= clearL then pick = clearR and 1 or -1
+            elseif DG.dir == 0 then pick = (sr >= sl) and 1 or -1
+            elseif DG.dir == 1 then pick = (sr * 1.25 >= sl) and 1 or -1
+            else pick = (sl * 1.25 >= sr) and -1 or 1 end
+            if DG.dir == 0 then
+                log(("[NÉ] vật cản cách %d stud (quét %d) -> lái %s"):format(
+                    math.floor(ahead), math.floor(look), pick > 0 and "phải" or "trái"))
+            end
+            DG.dir = pick
+            DG.untilT = now + 0.45
+            -- tốc độ đẩy ngang đủ để dịch ra khỏi làn bị chặn trước khi tới vật cản
+            local shift = (pick == 1) and shR or shL
+            DG.lat = math.clamp(shift * speed / math.max(ahead - R, 10) * 1.3, 15, CFG.DodgeSide)
+            DG.climb = (not clearR and not clearL) and 1 or 0 -- kín cả 2 bên -> bay cao lên
+        else
+            DG.lat = DG.lat * 0.7
+            if now > DG.untilT then DG.dir, DG.lat, DG.climb = 0, 0, 0 end
+        end
+        return DG.dir
     end
 end
-
-local function pathBlocked(origin, dir, dist)
-    local lat = Vector3.new(-dir.Z, 0, dir.X) * 5
-    return blockingHit(origin, dir * dist) or blockingHit(origin + lat, dir * dist) or blockingHit(origin - lat, dir * dist)
-end
-
 ------------------------------------------------------------------
 -- LÁI BẰNG PHÍM GIẢ LẬP (A/D hoặc ←/→)
 ------------------------------------------------------------------
@@ -812,34 +981,6 @@ local function setSteer(s)
     end
 end
 
--- NÉ VẬT CẢN
-local dodgeDir, dodgeUntil = 0, 0
-local function sideScore(pos, dir, side, s, look)
-    local res = blockingHit(pos, side * s * 40)
-    local sc = res and res.Distance or 40
-    if pathBlocked(pos + side * s * 22, dir, look) then sc -= 25 end
-    return sc
-end
-local function updateDodge(pos, dir, speed)
-    if not CFG.AvoidObstacles then dodgeDir = 0; return 0 end
-    local now = os.clock()
-    local look = CFG.ScanDist + speed * CFG.ScanTime
-    local side = Vector3.new(-dir.Z, 0, dir.X)
-    if pathBlocked(pos, dir, look) then
-        local sr = sideScore(pos, dir, side, 1, look)
-        local sl = sideScore(pos, dir, side, -1, look)
-        local pick
-        if dodgeDir == 1 then pick = (sr >= sl - 5) and 1 or -1
-        elseif dodgeDir == -1 then pick = (sl >= sr - 5) and -1 or 1
-        else pick = (sr >= sl) and 1 or -1 end
-        if dodgeDir == 0 then log(("[NÉ] vật cản trước %d stud -> lái %s"):format(math.floor(look), pick > 0 and "phải" or "trái")) end
-        dodgeDir = pick
-        dodgeUntil = now + 0.3
-    elseif now > dodgeUntil then
-        dodgeDir = 0
-    end
-    return dodgeDir
-end
 
 -- KẸO
 local CANDY_KW = {"candy", "kẹo", "lolli", "sweet", "sugar"}
@@ -933,83 +1074,161 @@ local function updateCandy(pos, dir)
     return lat > 0 and 1 or -1
 end
 
-------------------------------------------------------------------
--- TĂNG TỐC MÁY BAY
-------------------------------------------------------------------
 local moverList, lastMoverScan, speedRef = {}, 0, nil
+local applySpeed
+do
+    local moverState = setmetatable({}, {__mode = "k"})
 
-local function scanMovers()
-    lastMoverScan = os.clock()
-    local list = {}
-    local scope = planeCache and planeCache.Parent and planeCache or nil
-    if scope then
+    local function moverProp(inst)
+        if inst:IsA("BodyVelocity") then return "Velocity" end
+        local mode = inst.VelocityConstraintMode
+        if mode == Enum.VelocityConstraintMode.Line then return "LineVelocity" end
+        if mode == Enum.VelocityConstraintMode.Plane then return "PlaneVelocity" end
+        return "VectorVelocity"
+    end
+
+    local function scanMovers()
+        lastMoverScan = os.clock()
+        local list, seen = {}, {}
         local function consider(d)
-            if d:IsA("LinearVelocity") or d:IsA("BodyVelocity") then list[#list + 1] = {inst = d} end
+            if not seen[d] and (d:IsA("LinearVelocity") or d:IsA("BodyVelocity")) then
+                seen[d] = true
+                local m = moverState[d]
+                if not m then m = {inst = d}; moverState[d] = m end
+                list[#list + 1] = m
+            end
         end
-        consider(scope)
-        for _, d in ipairs(scope:GetDescendants()) do consider(d) end
+        local scope = planeCache and planeCache.Parent and planeCache or nil
+        if scope then
+            consider(scope)
+            for _, d in ipairs(scope:GetDescendants()) do consider(d) end
+            local part = partFromPlane(scope)
+            if part then
+                local ok, conn = pcall(function() return part:GetConnectedParts(true) end)
+                if ok then
+                    for _, p in ipairs(conn) do
+                        for _, d in ipairs(p:GetChildren()) do consider(d) end
+                    end
+                end
+            end
+            if scope:IsA("BasePart") and scope.Parent and scope.Parent:IsA("Model") and scope.Parent ~= workspace then
+                for _, d in ipairs(scope.Parent:GetDescendants()) do consider(d) end
+            end
+        end
+        moverList = list
     end
-    moverList = list
-end
 
-local function applyMovers(mult)
-    for i = #moverList, 1, -1 do
-        local m = moverList[i]
-        local inst = m.inst
-        if not inst.Parent then
-            table.remove(moverList, i)
-        else
-            local isBV = inst:IsA("BodyVelocity")
-            local prop = isBV and "Velocity" or "VectorVelocity"
-            if (not isBV) and inst.VelocityConstraintMode == Enum.VelocityConstraintMode.Line then prop = "LineVelocity" end
-            local ok = pcall(function()
-                local cur = inst[prop]
-                local changed
-                if m.last == nil then changed = true
-                elseif typeof(cur) == "Vector3" then changed = (cur - m.last).Magnitude > 0.01
-                else changed = math.abs(cur - m.last) > 0.01 end
-                if changed then m.orig = cur end
-                m.last = m.orig * mult
-                inst[prop] = m.last
-            end)
-            if not ok then table.remove(moverList, i) end
+    local function applyMovers(mult)
+        local any = false
+        for i = #moverList, 1, -1 do
+            local m = moverList[i]
+            local inst = m.inst
+            if not inst.Parent then
+                table.remove(moverList, i)
+            else
+                local ok = pcall(function()
+                    local prop = moverProp(inst)
+                    m.prop = prop
+                    if not m.forced then
+                        m.forced = true
+                        if inst:IsA("BodyVelocity") then
+                            inst.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                        else
+                            inst.MaxForce = math.huge
+                            pcall(function() inst.MaxAxesForce = Vector3.new(math.huge, math.huge, math.huge) end)
+                        end
+                    end
+                    local cur = inst[prop]
+                    local changed
+                    if m.last == nil then changed = true
+                    elseif type(cur) == "number" then changed = math.abs(cur - m.last) > 0.01
+                    else changed = (cur - m.last).Magnitude > 0.01 end
+                    if changed then m.orig = cur end -- game vừa ghi giá trị mới -> lấy làm gốc
+                    m.last = m.orig * mult
+                    inst[prop] = m.last
+                end)
+                if ok then any = true else table.remove(moverList, i) end
+            end
+        end
+        return any
+    end
+
+    local function restoreMovers()
+        for _, m in ipairs(moverList) do
+            if m.orig ~= nil and m.prop and m.inst.Parent then
+                pcall(function() m.inst[m.prop] = m.orig end)
+            end
         end
     end
-    return #moverList > 0
-end
 
-local function applySpeed(r, dir, now, dt)
-    if not CFG.SpeedBoost or r == root() then return end -- không tăng tốc khi chưa nhận được máy bay
-    local v = r.AssemblyLinearVelocity
-    local hs = Vector3.new(v.X, 0, v.Z).Magnitude
-    if not State.speedStart then
-        if hs > 5 then State.speedStart = now; speedRef = hs end
-        return
-    end
-    if now - State.speedStart < 0.5 then
-        if hs > speedRef then speedRef = hs end
-        return
-    end
-    if not speedRef or speedRef < 5 then State.speedStart = nil; return end
+    local function hlen(v) return math.sqrt(v.X * v.X + v.Z * v.Z) end
 
-    if State.cfMode then
-        r.CFrame = r.CFrame + dir * speedRef * (CFG.SpeedMult - 1) * dt
-        return
+    function applySpeed(r, dir, now, dt)
+        local v = r.AssemblyLinearVelocity
+        local hs = hlen(v)
+        local pos = r.Position
+        local actual = hs
+        if State.lastPos and dt > 0 then actual = hlen(pos - State.lastPos) / dt end
+        State.lastPos = pos
+        State.actual = actual
+
+        -- đo tốc độ gốc ở 0.35s đầu khi máy bay thật sự chuyển động
+        if not State.speedStart then
+            if hs > 5 then State.speedStart = now; speedRef = hs end
+            return
+        end
+        if now - State.speedStart < 0.35 then
+            if hs > speedRef then speedRef = hs end
+            return
+        end
+        if not speedRef or speedRef < 5 then State.speedStart = nil; return end
+
+        local mult, mode = CFG.SpeedMult, CFG.SpeedMode
+        if mode == 3 or State.cfMode then
+            r.CFrame = r.CFrame + dir * speedRef * (mult - 1) * dt
+            return
+        end
+
+        local moved = false
+        if mode ~= 2 and not State.velMode then
+            if now - lastMoverScan > 1 then scanMovers() end
+            moved = applyMovers(mult)
+        end
+        if not moved then
+            local hv = Vector3.new(v.X, 0, v.Z)
+            local heading = hv.Magnitude > 3 and hv.Unit or dir
+            local target = speedRef * mult
+            r.AssemblyLinearVelocity = Vector3.new(heading.X * target, v.Y, heading.Z * target)
+        end
+
+        -- chế độ tự động: không ăn thì chuyển mover -> ghi đè vận tốc -> dịch CFrame
+        if mode == 0 and mult >= 2 and now - State.speedStart > 0.9 then
+            if actual < speedRef * mult * 0.6 then
+                State.bad = (State.bad or 0) + dt
+                if State.bad > 0.5 then
+                    State.bad = 0
+                    if moved then
+                        restoreMovers()
+                        State.velMode = true
+                        log("[TỐC] mover không ăn -> ghi đè vận tốc")
+                    elseif not State.cfMode then
+                        State.cfMode = true
+                        log("[TỐC] vận tốc không ăn -> dịch CFrame")
+                    end
+                end
+            else
+                State.bad = 0
+            end
+        end
     end
 
-    if now - lastMoverScan > 1 then scanMovers() end
-    if not applyMovers(CFG.SpeedMult) then
-        local hv = Vector3.new(v.X, 0, v.Z)
-        local heading = hv.Magnitude > 3 and hv.Unit or dir
-        local target = speedRef * CFG.SpeedMult
-        r.AssemblyLinearVelocity = Vector3.new(heading.X * target, v.Y, heading.Z * target)
-    end
-    if CFG.SpeedMult >= 2 and hs < speedRef * CFG.SpeedMult * 0.5 then
-        State.bad = (State.bad or 0) + dt
-        if State.bad > 0.6 then State.cfMode = true; log("[TỐC] vận tốc không ăn -> chuyển sang dịch CFrame") end
-    else
-        State.bad = 0
-    end
+    -- ghi ở Stepped = ngay trước bước vật lý, sau mọi script RenderStepped của game
+    bind(RunService.Stepped:Connect(function(_, dt)
+        if not (CFG.SpeedBoost and inFlight and not reachedGate) then return end
+        local r = State.pr
+        if not (r and r.Parent) or r == root() or r.Anchored then return end
+        pcall(applySpeed, r, State.dir or Vector3.new(0, 0, -1), os.clock(), dt)
+    end))
 end
 
 ------------------------------------------------------------------
@@ -1019,6 +1238,7 @@ local function flightStep()
     if not (inFlight and not reachedGate) then
         if thrustForce then clearThrust() end
         if steerState ~= 0 then setSteer(0) end
+        State.pr = nil
         return
     end
     local r = planeRoot()
@@ -1042,6 +1262,7 @@ local function flightStep()
         if dir.Magnitude < 0.1 then dir = Vector3.new(0, 0, -1) end
         dir = dir.Unit
     end
+    State.pr, State.dir = r, dir -- để bước Stepped tăng tốc dùng
 
     if curGate and curGate.Parent then
         local d = curGate.Position - pos
@@ -1060,21 +1281,30 @@ local function flightStep()
     if CFG.KeepFlying and not r.Anchored and r ~= root() then
         ensureThrust(r)
         local g = workspace.Gravity
-        local up = g + math.clamp((baseY + CFG.HoldHeight - pos.Y) * 6, -g * 0.8, CFG.Lift)
+        local wantY = baseY + CFG.HoldHeight + (DG.climb == 1 and 40 or 0)
+        local up = g + math.clamp((wantY - pos.Y) * 6, -g * 0.8, CFG.Lift)
         local push = speed < CFG.FlySpeed and CFG.Push or 0
         thrustForce.Force = Vector3.new(dir.X * push, up, dir.Z * push) * r.AssemblyMass
     elseif thrustForce then
         clearThrust()
     end
 
-    refreshAvoidFilter()
-    local d = updateDodge(pos, dir, speed)
+    if now - (State.lastFilter or 0) > 0.25 then
+        State.lastFilter = now
+        refreshAvoidFilter()
+    end
+    -- dùng tốc độ thực đo được (khi đang dịch CFrame thì vận tốc không phản ánh đúng)
+    local sp = math.max(speed, State.actual or 0)
+    local d = updateDodge(pos, dir, sp)
     local c = (d == 0) and updateCandy(pos, dir) or 0
     setSteer(d ~= 0 and d or c)
 
-    applySpeed(r, dir, now, dt)
+    -- né chủ động: đẩy thân máy bay sang ngang ngay, không chờ máy bay tự bẻ lái theo phím
+    if d ~= 0 and CFG.DodgeAssist and DG.lat > 1 and not r.Anchored and r ~= root() then
+        local side = Vector3.new(-dir.Z, 0, dir.X)
+        r.CFrame = r.CFrame + side * d * DG.lat * dt
+    end
 end
-
 bind(RunService.Heartbeat:Connect(function()
     local ok, err = pcall(flightStep)
     if not ok and State.lastErr ~= tostring(err) then
@@ -1142,20 +1372,13 @@ local function findUnlocks()
                 local lc = v:FindFirstAncestorWhichIsA("LayerCollector")
                 if lc then texts[#texts + 1] = collectTexts(lc) end
                 texts[#texts + 1] = collectTexts(part)
-                if part.Parent and part.Parent ~= workspace and part.Parent:IsA("Model") then texts[#texts + 1] = part.Parent.Name end
-                add(part, {part = part, name = v.Name, mult = parseMult(table.concat(texts, " "))})
-            end
-        end
-    end
-    local pg = lp:FindFirstChildOfClass("PlayerGui")
-    if pg then
-        for _, v in ipairs(pg:GetDescendants()) do
-            if (v:IsA("TextLabel") or v:IsA("TextButton")) and hasKw(v.Text, UNLOCK_KW) and visibleChain(v) then
-                local btn = v:IsA("GuiButton") and v or v:FindFirstAncestorWhichIsA("GuiButton")
-                if btn then
-                    local blob = v.Text .. " " .. collectTexts(btn) .. " " .. btn.Name
-                    add(btn, {btn = btn, name = btn.Name, mult = parseMult(blob)})
+                if v:IsA("Model") then texts[#texts + 1] = collectTexts(v) end
+                if part.Parent and part.Parent ~= workspace and part.Parent:IsA("Model") then
+                    texts[#texts + 1] = part.Parent.Name
+                    texts[#texts + 1] = collectTexts(part.Parent)
                 end
+                local mult = parseMult(table.concat(texts, " "))
+                if mult > 0 then add(part, {part = part, name = v.Name, mult = mult}) end
             end
         end
     end
@@ -1163,96 +1386,76 @@ local function findUnlocks()
     return res
 end
 
-local function triggerUnlock(u)
-    if u.btn then
-        local b = u.btn
-        local fired = false
-        if type(getconnections) == "function" then
-            for _, ev in ipairs({b.MouseButton1Click, b.Activated, b.MouseButton1Down}) do
-                pcall(function()
-                    for _, c in ipairs(getconnections(ev)) do c:Fire() fired = true end
-                end)
-            end
-        end
-        if not fired then
-            local inset = GuiService:GetGuiInset()
-            local x = b.AbsolutePosition.X + b.AbsoluteSize.X / 2
-            local y = b.AbsolutePosition.Y + b.AbsoluteSize.Y / 2 + inset.Y
-            pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
-            mouseBtn(x, y, true); task.wait(0.05); mouseBtn(x, y, false)
-        end
-        return
-    end
-    local part, r = u.part, root()
-    if not part then return end
-    if r then r.CFrame = part.CFrame + Vector3.new(0, part.Size.Y / 2 + 3, 0) end
-    task.wait(0.25)
-    if firetouchinterest and r then
-        pcall(function() firetouchinterest(r, part, 0); firetouchinterest(r, part, 1) end)
-    end
-    local scopes = {part}
-    if part.Parent and part.Parent ~= workspace then scopes[#scopes + 1] = part.Parent end
-    for _, sc in ipairs(scopes) do
-        for _, d in ipairs(sc:GetDescendants()) do
-            if d:IsA("ProximityPrompt") and fireproximityprompt then
-                pcall(function() d.HoldDuration = 0; fireproximityprompt(d) end)
-            elseif d:IsA("ClickDetector") and fireclickdetector then
-                pcall(function() fireclickdetector(d) end)
-            end
-        end
-    end
-end
-
-local farmCF, farmPartCache, lastFarmScan = nil, nil, 0
-local function findFarmPart()
-    if farmPartCache and farmPartCache.Parent then return farmPartCache end
-    if os.clock() - lastFarmScan < 3 then return nil end
-    lastFarmScan = os.clock()
-    for _, v in ipairs(workspace:GetDescendants()) do
-        local hit = hasKw(v.Name, FARM_KW)
-        if not hit and (v:IsA("TextLabel") or v:IsA("TextButton")) then hit = hasKw(v.Text, FARM_KW) end
-        if hit then
-            local p = partOf(v)
-            if p then farmPartCache = p; return p end
-        end
-    end
-end
-local function farmTarget()
-    if farmCF then return farmCF end
-    local p = findFarmPart()
-    if p then return p.CFrame + Vector3.new(0, p.Size.Y / 2 + 3, 0) end
-end
-
 local farmStatus, lastUnlockCheck, lastUnlockPart, lastUnlockTime = "tắt", 0, nil, 0
+local x2Clicked = setmetatable({}, {__mode = "k"})
 local function unlockBest(force)
     local list = findUnlocks()
     local u = list[1]
-    if not u then
-        farmStatus = "không thấy 'Mở khóa'"
+    if not u or not u.part or not u.part.Parent then
+        farmStatus = "không thấy khu vực 'Mở khóa' có hệ số"
         return nil, list
     end
-    local key = u.part or u.btn
-    farmStatus = ("Mở khóa nhân cao nhất: x%s (%s)"):format(tostring(u.mult), u.name)
+    local r = root()
+    if not r then return nil, list end
+    local key = u.part
+    farmStatus = ("Đã chọn khu vực %s (x%s)"):format(u.name, tostring(u.mult))
     if force or key ~= lastUnlockPart or os.clock() - lastUnlockTime > 30 then
         lastUnlockPart, lastUnlockTime = key, os.clock()
-        log(("[FAM] mở khóa %s (x%s)"):format(u.name, tostring(u.mult)))
-        triggerUnlock(u)
+        local cf = u.part.CFrame + Vector3.new(0, u.part.Size.Y / 2 + 3, 0)
+        r.CFrame = cf
+        log(("[FAM] chọn khu vực %s (x%s), đã teleport"):format(u.name, tostring(u.mult)))
     end
     return u, list
+end
+
+local function clickX2Strength()
+    local pg = lp:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+    for btn in pairs(x2Clicked) do
+        if not btn.Parent or not visibleChain(btn) then x2Clicked[btn] = nil end
+    end
+    for _, v in ipairs(pg:GetDescendants()) do
+        if (v:IsA("TextButton") or v:IsA("TextLabel")) and visibleChain(v) then
+            local btn = v:IsA("GuiButton") and v or v:FindFirstAncestorWhichIsA("GuiButton")
+            local label = (v.Text .. " " .. v.Name):lower():gsub("<[^>]->", "")
+            local isStrength = label:find("x2 sức mạnh", 1, true) or label:find("x2 suc manh", 1, true)
+            local isPower = label:find("x2 power", 1, true)
+            if btn and isStrength and not isPower and visibleChain(btn) and not x2Clicked[btn] then
+                local fullLabel = (btn.Name .. " " .. (btn:IsA("TextButton") and btn.Text or "")):lower()
+                if not fullLabel:find("x2 power", 1, true) then
+                    x2Clicked[btn] = true
+                    local fired = false
+                    if type(getconnections) == "function" then
+                        local ok = pcall(function()
+                            for _, c in ipairs(getconnections(btn.Activated)) do c:Fire(); fired = true end
+                        end)
+                        if not ok then fired = false end
+                    end
+                    if not fired then pcall(function() btn:Activate() end) end
+                    log("[FAM] đã nhấn x2 sức mạnh")
+                    return
+                end
+            end
+        end
+    end
 end
 
 local function farmTick()
     if os.clock() - lastUnlockCheck > 8 then
         lastUnlockCheck = os.clock()
         pcall(unlockBest)
+    else
+        local u = lastUnlockPart
+        if u and u.Parent then
+            local r = root()
+            if r then
+                local cf = u.CFrame + Vector3.new(0, u.Size.Y / 2 + 3, 0)
+                local d = r.Position - cf.Position
+                if Vector3.new(d.X, 0, d.Z).Magnitude > 10 or math.abs(d.Y) > 15 then r.CFrame = cf end
+            end
+        end
     end
-    local cf, r = farmTarget(), root()
-    if cf and r then
-        local d = r.Position - cf.Position
-        if Vector3.new(d.X, 0, d.Z).Magnitude > 10 or math.abs(d.Y) > 15 then r.CFrame = cf end
-    elseif not cf then
-        farmStatus = "chưa thấy chỗ fam lực (hãy bấm Lưu vị trí fam lực)"
-    end
+    pcall(clickX2Strength) -- chỉ nhấn x2 sức mạnh; tuyệt đối bỏ qua x2 Power
 end
 
 ------------------------------------------------------------------
@@ -1271,7 +1474,8 @@ local function throwOnce()
     candyList, lastCandyScan, candyTarget = {}, 0, nil
     speedRef, moverList, lastMoverScan = nil, {}, 0
     State.speedStart, State.cfMode, State.bad, State.lastStep = nil, false, 0, nil
-    dodgeDir, dodgeUntil = 0, 0
+    State.velMode, State.lastPos, State.actual, State.lastFilter = false, nil, 0, 0
+    DG.dir, DG.untilT, DG.lat, DG.climb, DG.lastScan = 0, 0, 0, 0, 0
     releaseKeys()
 
     throwStartT = os.clock()
@@ -1886,8 +2090,12 @@ end)
 button(pThrow, "🖱 Test giữ chuột (1 lần)", function()
     task.spawn(function() holdThrow(true) end)
 end, Color3.fromRGB(45, 55, 105))
+button(pThrow, "🧹 Quên thanh lực đã học/chọn", function()
+    meterObj, State.meterLearned = nil, false
+    notify("Thanh lực", "Đã xóa, lần giữ tới sẽ tự dò lại")
+end, Color3.fromRGB(45, 55, 105))
 stepper(pThrow, "Mức lực để thả (0-1)", "PowerGoal", 0.01, 0.8, 1, 2)
-stepper(pThrow, "Đoán trước (giây)", "Lead", 0.01, 0, 0.15, 2)
+stepper(pThrow, "Đoán trước (giây)", "Lead", 0.01, 0, 0.25, 2)
 toggle(pThrow, "Tự chỉnh độ trễ đoán trước", "AutoLead")
 toggle(pThrow, "Bấm màn hình khi máy bay đáp", "LandTap")
 stepper(pThrow, "Giữ tối đa (giây)", "MaxCharge", 1, 3, 30, 0)
@@ -1910,14 +2118,20 @@ end)
 
 -- Tab Bay
 local pFly = addTab("Bay", "🚀")
-flyInfo = infoLabel(pFly, 56)
+flyInfo = infoLabel(pFly, 70)
 toggle(pFly, "Xuyên vật thể khi bay", "NoclipPlane")
 toggle(pFly, "Lực nâng + đẩy tiến", "KeepFlying")
 toggle(pFly, "Tăng tốc máy bay (ghi đè)", "SpeedBoost")
-stepper(pFly, "Hệ số tốc độ (4 = 400%)", "SpeedMult", 0.5, 1, 10, 1)
+stepper(pFly, "Hệ số tốc độ (5 = 500%)", "SpeedMult", 0.5, 1, 30, 1)
+stepper(pFly, "Kiểu tốc: 0 tự,1 mover,2 vận tốc,3 CF", "SpeedMode", 1, 0, 3, 0, function()
+    State.cfMode, State.velMode = false, false
+end)
 toggle(pFly, "Tự né vật cản (giữ phím lái)", "AvoidObstacles")
-stepper(pFly, "Quét trước (stud)", "ScanDist", 1, 1, 100, 0)
-stepper(pFly, "Quét thêm theo tốc độ (s)", "ScanTime", 0.05, 0, 1.5, 2)
+toggle(pFly, "Né chủ động (đẩy ngang máy bay)", "DodgeAssist")
+stepper(pFly, "Né: đẩy ngang tối đa (stud/s)", "DodgeSide", 25, 25, 800, 0)
+stepper(pFly, "Bề ngang máy bay (stud)", "PlaneRadius", 1, 2, 20, 0)
+stepper(pFly, "Quét trước (stud)", "ScanDist", 5, 5, 300, 0)
+stepper(pFly, "Quét thêm theo tốc độ (s)", "ScanTime", 0.1, 0, 3, 2)
 toggle(pFly, "Lái tới kẹo (đường thoáng)", "AutoCandy")
 stepper(pFly, "Kẹo: lệch tối đa (stud)", "CandyLateral", 10, 20, 300, 0)
 stepper(pFly, "Kẹo: nhìn trước (stud)", "CandyAhead", 25, 50, 800, 0)
@@ -1945,21 +2159,17 @@ end)
 -- Tab Fam lực
 local pFarm = addTab("Fam lực", "💪")
 farmInfo = infoLabel(pFarm, 46)
-toggle(pFarm, "Auto fam lực (tele + mở khóa)", "FarmPower")
+toggle(pFarm, "Auto fam lực (chọn xN cao nhất + teleport)", "FarmPower")
 stepper(pFarm, "Ở chỗ fam (giây/vòng)", "FarmTime", 1, 2, 120, 0)
 toggle(pFarm, "Auto tái sinh (Rebirth)", "AutoRebirth")
 stepper(pFarm, "Tái sinh mỗi (giây)", "RebirthEvery", 1, 1, 120, 0)
 button(pFarm, "♻ Tái sinh ngay 1 lần", function()
     notify("Rebirth", doRebirth() and "Đã gửi lệnh tái sinh" or "Không thấy remote Rebirth")
 end, Color3.fromRGB(45, 55, 105))
-infoLabel(pFarm, 44).Text = "Khi bật cùng Auto Ném: fam lực trước, rồi quay lại Khu vực phóng ném.\nTự tìm 'Mở khóa' có hệ số xN cao nhất và mở."
-button(pFarm, "📍 Lưu vị trí fam lực (đang đứng)", function(b)
-    local r = root()
-    if r then farmCF = r.CFrame; b.Text = "📍 Đã lưu chỗ fam lực ✓" end
-end)
-button(pFarm, "↩ Teleport đến chỗ fam lực", function()
-    local cf, r = farmTarget(), root()
-    if cf and r then r.CFrame = cf else notify("Fam lực", "Chưa thấy chỗ fam, hãy đứng ở đó rồi bấm Lưu") end
+infoLabel(pFarm, 54).Text = "Tự quét các khu vực 'Mở khóa', chọn hệ số xN cao nhất rồi teleport đến đó.\nTự nhấn x2 sức mạnh khi xuất hiện; bỏ qua x2 Power. Khu vực phóng chỉ dùng cho Auto Ném."
+button(pFarm, "↩ Teleport đến khu Mở khóa xN cao nhất", function()
+    local u = unlockBest(true)
+    if not u then notify("Fam lực", "Không tìm thấy khu vực Mở khóa có hệ số") end
 end)
 button(pFarm, "🔍 Quét 'Mở khóa' (xem log)", function()
     task.spawn(function()
@@ -1972,10 +2182,10 @@ button(pFarm, "🔍 Quét 'Mở khóa' (xem log)", function()
         notify("Mở khóa", ("Thấy %d, cao nhất x%s"):format(#list, tostring(list[1].mult)))
     end)
 end)
-button(pFarm, "🔓 Mở khóa cao nhất ngay", function()
+button(pFarm, "🎯 Chọn + teleport khu Mở khóa cao nhất", function()
     task.spawn(function()
         local u = unlockBest(true)
-        if u then notify("Mở khóa", "Đã thử x" .. tostring(u.mult)) else notify("Mở khóa", "Không thấy 'Mở khóa'") end
+        if u then notify("Mở khóa", "Đã teleport đến " .. u.name .. " (x" .. tostring(u.mult) .. ")") else notify("Mở khóa", "Không thấy khu vực 'Mở khóa'") end
     end)
 end)
 
@@ -2111,13 +2321,15 @@ task.spawn(function()
                 local d = curGate.Position - pr.Position
                 dist = (" | còn %d stud"):format(math.floor(Vector3.new(d.X, 0, d.Z).Magnitude))
             end
-            flyInfo.Text = ("Cổng: %s (%d vật khớp)%s\nTrạng thái: %s\nBay: %s | Lái: %d | né: %d | tốc: %s"):format(
+            flyInfo.Text = ("Cổng: %s (%d vật khớp)%s\nTrạng thái: %s\nBay: %s | Lái: %d | né: %d (cách %s)\nTốc: %s | thực %d stud/s"):format(
                 curGate and curGate.Name or "chưa chọn", #gates, dist,
                 reachedGate and "đã chạm cổng" or (inFlight and "đang bay" or "chờ ném"),
                 (planeCache and planeCache.Parent) and planeCache.Name or "chưa nhận",
-                steerState, dodgeDir, State.cfMode and "CFrame" or "vận tốc")
+                steerState, DG.dir, DG.ahead and tostring(math.floor(DG.ahead)) or "-",
+                State.cfMode and "CFrame" or (State.velMode and "vận tốc" or "mover"),
+                math.floor(State.actual or 0))
             farmInfo.Text = "Fam lực: " .. (CFG.FarmPower and farmStatus or "tắt") ..
-                "\nChỗ fam: " .. ((farmCF and "đã lưu tay") or (farmPartCache and farmPartCache.Parent and "tự tìm ✓") or "chưa thấy")
+                "\nKhu vực: " .. ((lastUnlockPart and lastUnlockPart.Parent and lastUnlockPart.Name) or "chưa chọn")
             nowPlaying.Text = "♪ " .. Music.CurrentName .. (MusicSound.Playing and "  (đang phát)" or "  (tạm dừng)")
             local n, tail = #logs, {}
             for i = math.max(1, n - 11), n do tail[#tail + 1] = logs[i] end
