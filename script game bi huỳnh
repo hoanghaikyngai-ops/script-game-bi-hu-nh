@@ -1,11 +1,15 @@
---// H-HUB | Paper Plane Hub v4.1 (bỏ tele máy bay, lái bằng phím giả lập)
---// Thay đổi so với v3:
---//  * NÉM BẰNG GIẢ LẬP CHUỘT: giữ chuột -> đọc thanh lực trên màn hình -> đủ 100% mới thả (không dùng remote nữa)
---//  * Điểm bấm chuột tự né bảng giao diện của script (và nút/GUI khác của game)
---//  * Tự né vật cản bằng TELE sang trái / phải
---//  * Tự TELE máy bay sang trái / phải để nhặt kẹo
---//  * Máy bay gần chạm đất -> TELE lên lại độ cao ban đầu, bay tiếp cho tới khi chạm cổng
---//  * Tab "Fam lực": tele đến chỗ fam lực, tự tìm "Mở khóa" có hệ số nhân cao nhất và mở
+--// H-HUB | Paper Plane Hub v4.2
+--// v4.2 (sửa lỗi + nâng cấp so với v4.1):
+--//  * SỬA LỖI KHÔNG BẬT ĐƯỢC: v4.1 vượt giới hạn 200 biến local của Luau nên không biên dịch được.
+--//    Giao diện giờ nằm trong hàm buildUI(), nhiều khối nhỏ được bọc do...end, bỏ hàm thừa.
+--//  * WaitForChild có thời gian chờ (không treo vô hạn nếu game đổi tên module)
+--//  * Nút tròn "H" nổi trên màn hình để ẩn/hiện bảng (dùng được trên mobile, kéo thả được)
+--//  * Vòng điều khiển bay bọc pcall: lỗi không còn spam mỗi khung hình, được ghi vào tab Log
+--//  * Giảm giật: quét kẹo 3 giây/lần, auto thu coin 1 giây/lần
+--//  * Hiện Coin/giờ ở tab Auto Ném
+--//  * Phím tắt: F = bay, J = xuyên vật thể, K = bật/tắt Auto Ném, LeftCtrl = ẩn/hiện bảng
+--//  Giữ nguyên: ném bằng giả lập chuột, đoán trước thả 100%, né vật cản, lái tới kẹo, tăng tốc,
+--//  fam lực + Mở khóa, tái sinh, nhạc, ESP, hop server, auto execute, lưu config.
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -21,7 +25,7 @@ local lp = Players.LocalPlayer
 
 if getgenv().PPHubUnload then pcall(getgenv().PPHubUnload) end
 
-local State = {Running = true}
+local State = {Running = true, t0 = os.clock()}
 local conns = {}
 local function bind(c) conns[#conns + 1] = c return c end
 
@@ -42,7 +46,6 @@ local CFG = {
     FullBright = false, NoFog = false,
     AntiAFK = true, AutoExecute = false, DisableKeybinds = false,
     AvoidObstacles = true, TeleRadius = 15, StillTime = 1.5, GateWait = 15,
-    -- mới v4
     PowerGoal = 1, Lead = 0.08, AutoLead = true, MaxCharge = 10, ClickOffY = 0, LandTap = true,
     ScanDist = 5, ScanTime = 0.4, SteerKeys = 1, SteerInvert = false, SteerRemote = false,
     SpeedBoost = true, SpeedMult = 4,
@@ -93,7 +96,7 @@ end
 -- GUI gốc + thông báo
 ------------------------------------------------------------------
 local main -- khai báo trước, gán ở phần giao diện
-local blur, MusicSound, Music, grad, glowGrad, stripGrad, dots, status, flyInfo, farmInfo, nowPlaying, logLabel, flyToggle, noclipToggle
+local blur, grad, glowGrad, stripGrad, dots, status, flyInfo, farmInfo, nowPlaying, logLabel, flyToggle, noclipToggle
 
 local gui = new("ScreenGui", {Name = "HHubPaperPlane", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 100},
     (gethui and gethui()) or game:GetService("CoreGui"))
@@ -120,6 +123,16 @@ end
 local function log(s)
     logs[#logs + 1] = s
     if #logs > 300 then table.remove(logs, 1) end
+end
+
+-- rút gọn số: 12345 -> 12.3K
+local function abbr(n)
+    n = tonumber(n) or 0
+    local a = math.abs(n)
+    if a >= 1e9 then return ("%.2fB"):format(n / 1e9)
+    elseif a >= 1e6 then return ("%.2fM"):format(n / 1e6)
+    elseif a >= 1e3 then return ("%.1fK"):format(n / 1e3) end
+    return tostring(math.floor(n))
 end
 
 ------------------------------------------------------------------
@@ -177,7 +190,7 @@ local function partOf(inst)
 end
 
 ------------------------------------------------------------------
--- LOGIC GAME (remote chỉ còn dùng để đọc mã chuyến bay / sự kiện kết thúc, KHÔNG dùng để ném)
+-- LOGIC GAME (remote chỉ dùng để đọc mã chuyến bay / sự kiện kết thúc, KHÔNG dùng để ném)
 ------------------------------------------------------------------
 local folder = RS:FindFirstChild("PaperPlaneRemotes") or RS:WaitForChild("PaperPlaneRemotes", 5)
 local Remote = folder and (folder:FindFirstChild("PlaneFlight") or folder:WaitForChild("PlaneFlight", 5))
@@ -190,7 +203,10 @@ if Remote then log("[INFO] Remote = " .. Remote.ClassName .. " (" .. Remote:GetF
 
 local BC
 pcall(function()
-    BC = require(RS:WaitForChild("PaperUI"):WaitForChild("BackendClient"))
+    local ui = RS:WaitForChild("PaperUI", 5)
+    local mod = ui and ui:WaitForChild("BackendClient", 5)
+    if not mod then return end
+    BC = require(mod)
     local orig = BC.Call
     BC.Call = function(...)
         if CFG.SpyBackend then log("[BACKEND] " .. fmt(...)) end
@@ -288,7 +304,7 @@ local function mouseBtn(x, y, down)
 end
 
 local function overMain(x, y, pad)
-    if not main then return false end
+    if not (main and main.Visible) then return false end
     local p, s = main.AbsolutePosition, main.AbsoluteSize
     return x > p.X - pad and x < p.X + s.X + pad and y > p.Y - pad and y < p.Y + s.Y + pad
 end
@@ -327,9 +343,8 @@ local function pickClickPoint()
 end
 
 -- Thanh lực
-local meterObj, pickMode, lastDetect, lastPower, lastMeterName = nil, false, 0, nil, nil
+local meterObj, pickMode, lastPower, lastMeterName = nil, false, nil, nil
 local METER_KW = {"power", "charge", "lực", "luc", "force", "meter", "strength", "throw"}
-local PURE_PCT = "^%s*(%d+%.?%d*)%s*%%%s*$"
 
 local function nameHas(inst)
     local p, n = inst, 0
@@ -383,38 +398,6 @@ local function readObj(o)
         end
     end
     return nil
-end
-
-local function detectMeter()
-    local pg = lp:FindFirstChildOfClass("PlayerGui")
-    if not pg then return nil end
-    local frameCand, textFallback
-    for _, o in ipairs(pg:GetDescendants()) do
-        if o:IsA("TextLabel") and o.Text:match(PURE_PCT) and visibleChain(o) then
-            if nameHas(o) then return o end
-            textFallback = textFallback or o
-        elseif o:IsA("Frame") and visibleChain(o) and o.AbsoluteSize.X > 0 and nameHas(o) then
-            local n = o.Name:lower()
-            if n:find("fill") or n:find("bar") or n:find("progress") then
-                frameCand = frameCand or o
-            end
-        end
-    end
-    return frameCand or textFallback
-end
-
-local function readPower(fast)
-    if not (meterObj and meterObj.Parent) then
-        meterObj = nil
-        if os.clock() - lastDetect > (fast and 0.3 or 1) then
-            lastDetect = os.clock()
-            meterObj = detectMeter()
-        end
-    end
-    if not meterObj then return nil end
-    local v = readObj(meterObj)
-    if v then lastPower = v end
-    return v
 end
 
 -- Bấm vào thanh lực trong game để chọn thủ công (khi tự dò không ra)
@@ -817,7 +800,7 @@ end
 local function updateCandy(pos, dir)
     if not CFG.AutoCandy then candyTarget = nil; return 0 end
     local now = os.clock()
-    if now - lastCandyScan > 2 then scanCandy() end
+    if now - lastCandyScan > 3 then scanCandy() end
     local right = Vector3.new(-dir.Z, 0, dir.X)
 
     if candyTarget then
@@ -934,9 +917,9 @@ local function applySpeed(r, dir, now)
 end
 
 ------------------------------------------------------------------
--- VÒNG ĐIỀU KHIỂN MÁY BAY MỖI KHUNG HÌNH
+-- VÒNG ĐIỀU KHIỂN MÁY BAY MỖI KHUNG HÌNH (bọc pcall, lỗi chỉ ghi log 1 lần)
 ------------------------------------------------------------------
-bind(RunService.Heartbeat:Connect(function()
+local function flightStep()
     if not (inFlight and not reachedGate) then
         if thrustForce then clearThrust() end
         if steerState ~= 0 then setSteer(0) end
@@ -995,6 +978,14 @@ bind(RunService.Heartbeat:Connect(function()
     setSteer(d ~= 0 and d or c)
 
     applySpeed(r, dir, now)
+end
+
+bind(RunService.Heartbeat:Connect(function()
+    local ok, err = pcall(flightStep)
+    if not ok and State.lastErr ~= tostring(err) then
+        State.lastErr = tostring(err)
+        log("[LOI bay] " .. State.lastErr)
+    end
 end))
 
 ------------------------------------------------------------------
@@ -1279,6 +1270,7 @@ task.spawn(function()
                 if not ok then log("[LOI] " .. tostring(err)); mouseBtn(0, 0, false) end
                 inFlight = false
                 clearThrust()
+                releaseKeys()
                 task.wait(CFG.Between)
             end
         end
@@ -1296,24 +1288,27 @@ task.spawn(function()
 end)
 
 -- Auto tái sinh: ReplicatedStorage.PaperPlaneRemotes.Rebirth
-local rebirths = 0
-local function doRebirth()
-    local rb = (folder and folder:FindFirstChild("Rebirth"))
-        or (RS:FindFirstChild("PaperPlaneRemotes") and RS.PaperPlaneRemotes:FindFirstChild("Rebirth"))
-    if not rb then return false end
-    local ok, err
-    if rb:IsA("RemoteFunction") then
-        ok, err = pcall(function() return rb:InvokeServer() end)
-    else
-        ok, err = pcall(function() rb:FireServer() end)
+local doRebirth
+do
+    local rebirths = 0
+    function doRebirth()
+        local rb = (folder and folder:FindFirstChild("Rebirth"))
+            or (RS:FindFirstChild("PaperPlaneRemotes") and RS.PaperPlaneRemotes:FindFirstChild("Rebirth"))
+        if not rb then return false end
+        local ok, err
+        if rb:IsA("RemoteFunction") then
+            ok, err = pcall(function() return rb:InvokeServer() end)
+        else
+            ok, err = pcall(function() rb:FireServer() end)
+        end
+        if ok then
+            rebirths += 1
+            log("[REBIRTH] đã gửi tái sinh lần " .. rebirths)
+        else
+            log("[REBIRTH] lỗi: " .. tostring(err))
+        end
+        return ok
     end
-    if ok then
-        rebirths += 1
-        log("[REBIRTH] đã gửi tái sinh lần " .. rebirths)
-    else
-        log("[REBIRTH] lỗi: " .. tostring(err))
-    end
-    return ok
 end
 
 task.spawn(function()
@@ -1325,61 +1320,66 @@ task.spawn(function()
     end
 end)
 
-local COLLECT_KW = {"coin", "cash", "reward", "star", "gem", "orb", "candy", "kẹo"}
-task.spawn(function()
-    while State.Running do
-        task.wait(0.5)
-        local r = root()
-        if CFG.AutoCollect and r and firetouchinterest then
-            pcall(function()
-                for _, v in ipairs(workspace:GetDescendants()) do
-                    if v:IsA("BasePart") then
-                        local n = v.Name:lower()
-                        for _, k in ipairs(COLLECT_KW) do
-                            if n:find(k) and (v.Position - r.Position).Magnitude < 300 then
-                                firetouchinterest(r, v, 0); firetouchinterest(r, v, 1)
-                                break
+-- Auto thu coin/kẹo
+do
+    local COLLECT_KW = {"coin", "cash", "reward", "star", "gem", "orb", "candy", "kẹo"}
+    task.spawn(function()
+        while State.Running do
+            task.wait(1)
+            local r = root()
+            if CFG.AutoCollect and r and firetouchinterest then
+                pcall(function()
+                    for _, v in ipairs(workspace:GetDescendants()) do
+                        if v:IsA("BasePart") then
+                            local n = v.Name:lower()
+                            for _, k in ipairs(COLLECT_KW) do
+                                if n:find(k) and (v.Position - r.Position).Magnitude < 300 then
+                                    firetouchinterest(r, v, 0); firetouchinterest(r, v, 1)
+                                    break
+                                end
                             end
                         end
                     end
-                end
-            end)
-        end
-    end
-end)
-
--- Xuyên vật thể + WalkSpeed
-local stepAcc = 0
-bind(RunService.Stepped:Connect(function(_, dt)
-    stepAcc += dt
-    if stepAcc < 0.08 then return end
-    stepAcc = 0
-    local planeNoclip = CFG.NoclipPlane and inFlight
-    if CFG.LoopSpeed then
-        local h = humanoid()
-        if h and h.WalkSpeed ~= CFG.WalkSpeed then h.WalkSpeed = CFG.WalkSpeed end
-    end
-    if not CFG.Noclip and not planeNoclip then return end
-    if CFG.Noclip and lp.Character then
-        for _, p in ipairs(lp.Character:GetDescendants()) do
-            if p:IsA("BasePart") then p.CanCollide = false end
-        end
-    end
-    if planeNoclip then
-        local pl = findPlane()
-        if pl then
-            if pl:IsA("BasePart") then pl.CanCollide = false end
-            for _, p in ipairs(pl:GetDescendants()) do
-                if p:IsA("BasePart") then p.CanCollide = false end
+                end)
             end
         end
-        if lp.Character then
+    end)
+end
+
+-- Xuyên vật thể + WalkSpeed
+do
+    local stepAcc = 0
+    bind(RunService.Stepped:Connect(function(_, dt)
+        stepAcc += dt
+        if stepAcc < 0.08 then return end
+        stepAcc = 0
+        local planeNoclip = CFG.NoclipPlane and inFlight
+        if CFG.LoopSpeed then
+            local h = humanoid()
+            if h and h.WalkSpeed ~= CFG.WalkSpeed then h.WalkSpeed = CFG.WalkSpeed end
+        end
+        if not CFG.Noclip and not planeNoclip then return end
+        if CFG.Noclip and lp.Character then
             for _, p in ipairs(lp.Character:GetDescendants()) do
                 if p:IsA("BasePart") then p.CanCollide = false end
             end
         end
-    end
-end))
+        if planeNoclip then
+            local pl = findPlane()
+            if pl then
+                if pl:IsA("BasePart") then pl.CanCollide = false end
+                for _, p in ipairs(pl:GetDescendants()) do
+                    if p:IsA("BasePart") then p.CanCollide = false end
+                end
+            end
+            if lp.Character then
+                for _, p in ipairs(lp.Character:GetDescendants()) do
+                    if p:IsA("BasePart") then p.CanCollide = false end
+                end
+            end
+        end
+    end))
+end
 
 -- Anti-AFK
 bind(lp.Idled:Connect(function()
@@ -1438,15 +1438,17 @@ bind(lp.CharacterAdded:Connect(function()
     if CFG.PFly then startFly() end
 end))
 
-local lastJump = 0
-bind(UserInputService.JumpRequest:Connect(function()
-    if not CFG.InfJump or os.clock() - lastJump < 0.18 then return end
-    local h = humanoid()
-    if h and h.Health > 0 then
-        lastJump = os.clock()
-        h:ChangeState(Enum.HumanoidStateType.Jumping)
-    end
-end))
+do
+    local lastJump = 0
+    bind(UserInputService.JumpRequest:Connect(function()
+        if not CFG.InfJump or os.clock() - lastJump < 0.18 then return end
+        local h = humanoid()
+        if h and h.Health > 0 then
+            lastJump = os.clock()
+            h:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end))
+end
 
 local function clearESP()
     for _, p in ipairs(Players:GetPlayers()) do
@@ -1477,21 +1479,24 @@ task.spawn(function()
     end
 end)
 
-local origLight = {Brightness = Lighting.Brightness, ClockTime = Lighting.ClockTime, GlobalShadows = Lighting.GlobalShadows,
-    Ambient = Lighting.Ambient, OutdoorAmbient = Lighting.OutdoorAmbient, FogStart = Lighting.FogStart, FogEnd = Lighting.FogEnd}
-local function applyLight()
-    if CFG.FullBright then
-        Lighting.Brightness, Lighting.ClockTime, Lighting.GlobalShadows = 2, 14, false
-        Lighting.Ambient, Lighting.OutdoorAmbient = Color3.new(1, 1, 1), Color3.new(1, 1, 1)
+local applyLight, restoreLight
+do
+    local origLight = {Brightness = Lighting.Brightness, ClockTime = Lighting.ClockTime, GlobalShadows = Lighting.GlobalShadows,
+        Ambient = Lighting.Ambient, OutdoorAmbient = Lighting.OutdoorAmbient, FogStart = Lighting.FogStart, FogEnd = Lighting.FogEnd}
+    function applyLight()
+        if CFG.FullBright then
+            Lighting.Brightness, Lighting.ClockTime, Lighting.GlobalShadows = 2, 14, false
+            Lighting.Ambient, Lighting.OutdoorAmbient = Color3.new(1, 1, 1), Color3.new(1, 1, 1)
+        end
+        if CFG.NoFog then Lighting.FogStart, Lighting.FogEnd = 100000, 100000 end
     end
-    if CFG.NoFog then Lighting.FogStart, Lighting.FogEnd = 100000, 100000 end
-end
-local function restoreLight(which)
-    if which == "bright" then
-        Lighting.Brightness, Lighting.ClockTime, Lighting.GlobalShadows = origLight.Brightness, origLight.ClockTime, origLight.GlobalShadows
-        Lighting.Ambient, Lighting.OutdoorAmbient = origLight.Ambient, origLight.OutdoorAmbient
-    else
-        Lighting.FogStart, Lighting.FogEnd = origLight.FogStart, origLight.FogEnd
+    function restoreLight(which)
+        if which == "bright" then
+            Lighting.Brightness, Lighting.ClockTime, Lighting.GlobalShadows = origLight.Brightness, origLight.ClockTime, origLight.GlobalShadows
+            Lighting.Ambient, Lighting.OutdoorAmbient = origLight.Ambient, origLight.OutdoorAmbient
+        else
+            Lighting.FogStart, Lighting.FogEnd = origLight.FogStart, origLight.FogEnd
+        end
     end
 end
 bind(Lighting.Changed:Connect(function()
@@ -1538,13 +1543,16 @@ end
 ------------------------------------------------------------------
 -- AUTO EXECUTE (queue_on_teleport)
 ------------------------------------------------------------------
-local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport) or queueonteleport
-local queued = false
-local function queueAutoExec()
-    if not CFG.AutoExecute or queued or not queueTp then return end
-    if AUTOEXEC_URL == "" then return notify("Auto Execute", "Chưa đặt AUTOEXEC_URL ở đầu script") end
-    queued = true
-    pcall(queueTp, ([[task.spawn(function() if not game:IsLoaded() then game.Loaded:Wait() end task.wait(2) loadstring(game:HttpGet(%q))() end)]]):format(AUTOEXEC_URL))
+local queueAutoExec
+do
+    local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport) or queueonteleport
+    local queued = false
+    function queueAutoExec()
+        if not CFG.AutoExecute or queued or not queueTp then return end
+        if AUTOEXEC_URL == "" then return notify("Auto Execute", "Chưa đặt AUTOEXEC_URL ở đầu script") end
+        queued = true
+        pcall(queueTp, ([[task.spawn(function() if not game:IsLoaded() then game.Loaded:Wait() end task.wait(2) loadstring(game:HttpGet(%q))() end)]]):format(AUTOEXEC_URL))
+    end
 end
 bind(lp.OnTeleport:Connect(function() queueAutoExec() end))
 
@@ -1604,9 +1612,9 @@ local function playIndex(i)
 end
 
 ------------------------------------------------------------------
--- GIAO DIỆN
+-- GIAO DIỆN (nằm trong hàm riêng để không vượt giới hạn 200 local của Luau)
 ------------------------------------------------------------------
-do -- UI scope: giới hạn số local ở main chunk
+local function buildUI()
 blur = new("BlurEffect", {Size = CFG.Blur and 14 or 0}, Lighting)
 
 main = new("Frame", {Size = UDim2.fromOffset(500, 330), Position = UDim2.new(0.5, -250, 0.5, -165),
@@ -1621,6 +1629,15 @@ local function fit()
     scale.Scale = math.clamp(math.min(vp.X / 560, vp.Y / 380), 0.55, 1)
 end
 fit()
+
+-- Nút tròn "H" nổi: ẩn/hiện bảng (dùng được trên mobile, kéo thả được)
+local fab = new("TextButton", {Size = UDim2.fromOffset(40, 40), Position = UDim2.new(0, 8, 0.28, 0),
+    BackgroundColor3 = Color3.fromRGB(12, 14, 28), BackgroundTransparency = 0.15, Text = "H",
+    TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBlack, TextSize = 18,
+    Active = true, Draggable = true, ZIndex = 40}, gui)
+new("UICorner", {CornerRadius = UDim.new(1, 0)}, fab)
+new("UIStroke", {Thickness = 2, Color = Color3.fromRGB(70, 110, 230)}, fab)
+fab.MouseButton1Click:Connect(function() main.Visible = not main.Visible end)
 
 local function rainbow()
     local k = {}
@@ -1768,7 +1785,7 @@ end
 -- Tab Auto Ném
 local pThrow = addTab("Auto Ném", "🛩")
 status = infoLabel(pThrow, 46)
-toggle(pThrow, "Auto Ném máy bay", "AutoThrow")
+State.throwToggle = toggle(pThrow, "Auto Ném máy bay", "AutoThrow")
 infoLabel(pThrow, 70).Text = "Giữ chuột, tự theo dõi mọi % trên màn hình (% đứng yên 1 giây thì bỏ), đoán trước để thả đúng 100%.\nMáy bay đáp -> bấm màn hình 1 lần -> rồi mới giữ ném tiếp."
 button(pThrow, "🎯 Chọn thanh lực (bấm vào nó trong game)", function()
     pickMode = true
@@ -1879,7 +1896,7 @@ end)
 stepper(pPlayer, "Tốc độ bay", "PFlySpeed", 0.5, 0.5, 20, 1)
 noclipToggle = toggle(pPlayer, "Xuyên vật thể (nhân vật)", "Noclip")
 toggle(pPlayer, "Nhảy vô hạn", "InfJump")
-infoLabel(pPlayer, 30).Text = "Phím tắt: F = bay, J = xuyên vật thể, LeftCtrl = ẩn/hiện bảng."
+infoLabel(pPlayer, 44).Text = "Phím tắt (PC): F = bay, J = xuyên vật thể, K = bật/tắt Auto Ném, LeftCtrl = ẩn/hiện bảng.\nMobile: bấm nút tròn H để ẩn/hiện bảng."
 
 -- Tab Tiện ích
 local pUtil = addTab("Tiện ích", "🧰")
@@ -1947,7 +1964,9 @@ end, Color3.fromRGB(150, 70, 70))
 infoLabel(pSet, 40).Text = "Config tự lưu mỗi khi đổi. Auto Execute cần điền AUTOEXEC_URL (đầu file) hoặc getgenv().PPHubURL."
 
 selectTab("Auto Ném")
-end -- UI scope
+end
+
+buildUI()
 
 ------------------------------------------------------------------
 -- PHÍM TẮT
@@ -1956,18 +1975,22 @@ bind(UserInputService.InputBegan:Connect(function(input, processed)
     if processed or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
     if UserInputService:GetFocusedTextBox() then return end
     if input.KeyCode == Enum.KeyCode.LeftControl then
-        gui.Enabled = not gui.Enabled
+        main.Visible = not main.Visible
         return
     end
     if CFG.DisableKeybinds then return end
     if input.KeyCode == Enum.KeyCode.F then flyToggle:Set(not CFG.PFly)
-    elseif input.KeyCode == Enum.KeyCode.J then noclipToggle:Set(not CFG.Noclip) end
+    elseif input.KeyCode == Enum.KeyCode.J then noclipToggle:Set(not CFG.Noclip)
+    elseif input.KeyCode == Enum.KeyCode.K then
+        if State.throwToggle then State.throwToggle:Set(not CFG.AutoThrow) end
+    end
 end))
 
 ------------------------------------------------------------------
 -- LED + trạng thái
 ------------------------------------------------------------------
 bind(RunService.RenderStepped:Connect(function()
+    if not (grad and main and main.Visible) then return end
     local t = os.clock()
     grad.Rotation = (t * 140) % 360
     glowGrad.Rotation = (t * 140) % 360
@@ -1982,8 +2005,10 @@ end))
 task.spawn(function()
     while State.Running do
         pcall(function()
-            status.Text = ("Ném: %d | Coin +%s | Vị trí: %s\nThanh lực: %s | Lực cuối: %s"):format(
-                throws, tostring(getCoins() - startCoins),
+            local gained = getCoins() - startCoins
+            local hrs = (os.clock() - State.t0) / 3600
+            status.Text = ("Ném: %d | Coin +%s (%s/giờ) | Vị trí: %s\nThanh lực: %s | Lực cuối: %s"):format(
+                throws, abbr(gained), abbr(hrs > 0.003 and gained / hrs or 0),
                 (zoneCache and zoneCache.Parent and "Khu vực phóng ✓") or (throwSpot and "đã lưu") or "chưa",
                 lastMeterName and ("✓ " .. lastMeterName) or "chưa thấy",
                 lastPower and string.format("%.0f%%", lastPower * 100) or "-")
@@ -2032,4 +2057,4 @@ getgenv().PPHubUnload = function()
 end
 
 if CFG.AutoExecute then queueAutoExec() end
-notify("H-HUB", "Đã tải v4. Bật Auto Ném; nếu không thấy thanh lực hãy bấm 'Chọn thanh lực'.")
+notify("H-HUB", "Đã tải v4.2. Bật Auto Ném (hoặc phím K); nếu không thấy thanh lực hãy bấm 'Chọn thanh lực'.")
