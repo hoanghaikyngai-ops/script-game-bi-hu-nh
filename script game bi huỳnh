@@ -1,4 +1,4 @@
---// H-HUB | Paper Plane Hub v5.0 (bản hoàn chỉnh, gộp mọi bản sửa)
+--// H-HUB | Paper Plane Hub v5.1 (bản hoàn chỉnh, gộp mọi bản sửa)
 --// So với v4.2:
 --//  * Nhả lực: chụp danh sách % có sẵn TRƯỚC khi bấm, chỉ theo dõi % mới hiện / đổi sau khi bấm,
 --//    quét liên tục khi giữ, sửa chiều chỉnh Lead (thiếu lực -> nhả muộn hơn), Lead tối đa 0.15
