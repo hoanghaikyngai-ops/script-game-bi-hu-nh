@@ -1,12 +1,12 @@
---// H-HUB | Paper Plane Hub v5.0 (bản hoàn chỉnh, gộp mọi bản sửa)
---// So với v4.2:
---//  * Nhả lực: chụp danh sách % có sẵn TRƯỚC khi bấm, chỉ theo dõi % mới hiện / đổi sau khi bấm,
---//    quét liên tục khi giữ, sửa chiều chỉnh Lead (thiếu lực -> nhả muộn hơn), Lead tối đa 0.15
---//  * Né vật cản: bỏ qua kẹo/coin/cổng, không còn thoát khi Anchored, tự bật lái bằng remote
---//    nếu thấy game gửi "Steer"
---//  * Tăng tốc: đo tốc độ gốc khi máy bay thực sự chuyển động, tự chuyển sang dịch CFrame nếu vận tốc không ăn
---//  * Chỉ nhận máy bay CỦA MÌNH (flightId / owner / mới sinh sau khi nhả chuột & gần mình nhất), loại máy bay người khác
---//  * Tab Chẩn đoán trong Log: hiện máy bay đang nhận, hướng lái, né, kiểu tăng tốc
+--// H-HUB | Paper Plane Hub v6.0
+--// So với v5.0:
+--//  * Auto Ném: giữ chuột đúng HoldTime (mặc định 1 giây) rồi nhả, không quét thanh lực nữa (tắt "Giữ cố định" để dùng lại thanh lực)
+--//  * Quét vật cản viết lại theo Aircraft Radar: raycast thẳng phía trước + 2 tia sát 2 bên (1 stud), chênh cao vật cản,
+--//    dò làn trống bên trái/phải, tô đỏ vật cản (Radar)
+--//  * Tọa độ bay: đặt tọa độ -> máy bay tự lái tới đó, vẫn tự né vật cản
+--//  * Tốc độ máy bay đặt mức tối đa
+--//  * Fam lực: sửa tele (hàm unlockBest bị thiếu), đứng đúng khu cao nhất thì ở yên, có khu cao hơn thì tele lại
+--//  * Auto nhấn x2 sức mạnh chạy độc lập, click đúng tọa độ (có bù GuiInset)
 --//  Phím tắt: F = bay, J = xuyên vật thể, K = bật/tắt Auto Ném, LeftCtrl = ẩn/hiện bảng
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -18,12 +18,13 @@ local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 local GuiService = game:GetService("GuiService")
+local CollectionService = game:GetService("CollectionService")
 local VIM = game:GetService("VirtualInputManager")
 local lp = Players.LocalPlayer
 
 if getgenv().PPHubUnload then pcall(getgenv().PPHubUnload) end
 
-local State = {Running = true, t0 = os.clock(), cfMode = false, bad = 0}
+local State = {Running = true, t0 = os.clock(), cfMode = false, bad = 0, holding = false}
 local conns = {}
 local function bind(c) conns[#conns + 1] = c return c end
 
@@ -36,7 +37,7 @@ local CFG = {
     SpyBackend = false, Blur = false,
     ChargeHold = 1.2, Between = 1.5, MaxFlight = 90,
     SteerRate = 0.05, SteerY = 0,
-    HoldHeight = 10, FlySpeed = 200, Push = 80, Lift = 40,
+    HoldHeight = 10, FlySpeed = 1000, Push = 300, Lift = 120,
     UIAlpha = 0.25, Volume = 1,
     LoopSpeed = false, WalkSpeed = 30,
     PFly = false, PFlySpeed = 2,
@@ -46,14 +47,16 @@ local CFG = {
     AvoidObstacles = true, TeleRadius = 15, StillTime = 1.5, GateWait = 15,
     PowerGoal = 1, Lead = 0.05, AutoLead = true, MaxCharge = 10, ClickOffY = 0, LandTap = true,
     ScanDist = 30, ScanTime = 0.9, SteerKeys = 1, SteerInvert = false, SteerRemote = false,
-    SpeedBoost = true, SpeedMult = 5,
-    DodgeAssist = true, DodgeSide = 250, PlaneRadius = 6, ScanRate = 0.03, SpeedMode = 0, CfgVer = 0,
+    SpeedBoost = true, SpeedMult = 50,
+    DodgeAssist = true, DodgeSide = 250, PlaneRadius = 1, SideScan = 1, ScanRate = 0.03, SpeedMode = 0, CfgVer = 0,
     AutoCandy = true, CandyLateral = 90, CandyAhead = 400, CandyHeight = 25, CandyDead = 5,
-    FarmPower = false, FarmTime = 8,
+    FarmPower = false, FarmTime = 8, UnlockRecheck = 4, AutoX2 = true,
     AutoRebirth = false, RebirthEvery = 5,
     PlaneSpawnDist = 40,
+    FixedHold = true, HoldTime = 1, ReadyDelay = 0.5,
+    Radar = true,
+    UseWaypoint = false, WpSet = false, WpX = 0, WpY = 0, WpZ = 0, WpRadius = 40, WpFollowY = true,
 }
-local GATE_STOP = 30
 
 ------------------------------------------------------------------
 -- LƯU / ĐỌC CONFIG
@@ -84,9 +87,12 @@ end)
 CFG.AutoThrow = false -- không tự bật khi vừa chạy
 CFG.FarmPower = false
 CFG.AutoRebirth = false
-if (CFG.CfgVer or 0) < 51 then
-    CFG.ScanDist, CFG.ScanTime, CFG.SpeedMult, CFG.Lead = 30, 0.9, 5, 0.06
-    CFG.CfgVer = 51
+if (CFG.CfgVer or 0) < 60 then
+    CFG.ScanDist, CFG.ScanTime, CFG.Lead = 30, 0.9, 0.06
+    CFG.SpeedMult, CFG.FlySpeed, CFG.Push, CFG.Lift = 50, 1000, 300, 120
+    CFG.PlaneRadius, CFG.SideScan = 1, 1
+    CFG.FixedHold, CFG.HoldTime = true, 1
+    CFG.CfgVer = 60
 end
 if CFG.Lead > 0.25 or CFG.Lead < 0 then CFG.Lead = 0.06 end
 
@@ -101,7 +107,7 @@ end
 -- GUI gốc + thông báo
 ------------------------------------------------------------------
 local main
-local blur, grad, glowGrad, stripGrad, dots, status, flyInfo, farmInfo, nowPlaying, logLabel, flyToggle, noclipToggle
+local blur, grad, glowGrad, stripGrad, dots, status, flyInfo, farmInfo, nowPlaying, logLabel, flyToggle, noclipToggle, wpInfo
 
 local gui = new("ScreenGui", {Name = "HHubPaperPlane", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 100},
     (gethui and gethui()) or game:GetService("CoreGui"))
@@ -259,8 +265,10 @@ if folder then
 end
 
 -- Khu vực phóng
-local ZONE_NAMES = {"khu vực phóng", "khu vuc phong", "launch area", "launch zone"}
 local zoneCache
+local findZone
+do
+local ZONE_NAMES = {"khu vực phóng", "khu vuc phong", "launch area", "launch zone"}
 
 local function matchZone(s)
     s = tostring(s):lower()
@@ -270,7 +278,7 @@ local function matchZone(s)
 end
 
 local lastZoneScan = 0
-local function findZone()
+function findZone()
     if zoneCache and zoneCache.Parent then return zoneCache end
     if os.clock() - lastZoneScan < 2 then return nil end
     lastZoneScan = os.clock()
@@ -282,6 +290,7 @@ local function findZone()
             if p then zoneCache = p; return p end
         end
     end
+end
 end
 
 local function getThrowCFrame()
@@ -309,6 +318,8 @@ local function mouseBtn(x, y, down)
     end
 end
 
+local pickClickPoint
+do
 local function overMain(x, y, pad)
     if not (main and main.Visible) then return false end
     local p, s = main.AbsolutePosition, main.AbsoluteSize
@@ -324,7 +335,7 @@ local CLICK_CAND = {
     {0.08, 0.5}, {0.92, 0.5}, {0.5, 0.12}, {0.5, 0.9}, {0.15, 0.2}, {0.85, 0.2},
     {0.2, 0.85}, {0.8, 0.85}, {0.25, 0.5}, {0.75, 0.5}, {0.5, 0.3}, {0.5, 0.7},
 }
-local function pickClickPoint()
+function pickClickPoint()
     local cam = workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
     local inset = GuiService:GetGuiInset()
@@ -346,24 +357,10 @@ local function pickClickPoint()
     end
     return vp.X * 0.08, vp.Y * 0.5 + CFG.ClickOffY
 end
+end
 
 -- Thanh lực
 local meterObj, pickMode, lastPower, lastMeterName = nil, false, nil, nil
-local METER_KW = {"power", "charge", "lực", "luc", "force", "meter", "strength", "throw"}
-
-local function nameHas(inst)
-    local p, n = inst, 0
-    while p and p ~= game and n < 5 do
-        local s = viLower(p.Name)
-        for _, k in ipairs(METER_KW) do
-            if s:find(k, 1, true) then return true end
-        end
-        p = p.Parent
-        n += 1
-    end
-    return false
-end
-
 local function visibleChain(o)
     local p = o
     while p and p:IsA("GuiObject") do
@@ -436,6 +433,21 @@ end
 
 local holdThrow
 do
+local METER_KW = {"power", "charge", "lực", "luc", "force", "meter", "strength", "throw"}
+
+local function nameHas(inst)
+    local p, n = inst, 0
+    while p and p ~= game and n < 5 do
+        local s = viLower(p.Name)
+        for _, k in ipairs(METER_KW) do
+            if s:find(k, 1, true) then return true end
+        end
+        p = p.Parent
+        n += 1
+    end
+    return false
+end
+
     local function pctOnly(t)
         t = (tostring(t):gsub("<[^>]->", ""))
         return t:match("^%s*%d+[%.,]?%d*%s*%%%s*$") ~= nil
@@ -484,7 +496,6 @@ do
                         if v > s.hi then s.hi = v end
                         s.v = v
                     end
-                    -- nhãn đổi < 4 lần rồi đứng yên 1.5s = không phải thanh lực
                     if not s.manual and s.n < 4 and now - (s.tChange or s.born) > 1.5 then
                         self.items[o] = nil
                         self.ignored[o] = true
@@ -492,7 +503,6 @@ do
                 end
             end
         end
-        -- Chấm điểm: số lần đổi + biên độ (thanh lực chạy 0->100%) + chỉ có "xx%" + tên gợi ý
         function T:best()
             local bo, bs, bscore
             for o, s in pairs(self.items) do
@@ -508,7 +518,6 @@ do
         return T
     end
 
-    -- tốc độ đổi (đơn vị 1.0 = 100%) tính trên cửa sổ ~0.18s gần nhất
     local function rateOf(s)
         local h = s.hist
         local n = #h
@@ -538,10 +547,11 @@ do
         return table.concat(rows, " | ", 1, math.min(#rows, 4))
     end
 
-    function holdThrow(manual)
+    -- Chế độ dùng thanh lực (chỉ khi tắt "Giữ cố định")
+    local function holdMeter(manual)
         local T = newTracker()
         local t00 = os.clock()
-        T:snapshot() -- chụp mọi % đang hiện sẵn TRƯỚC khi bấm
+        T:snapshot()
         if meterObj and meterObj.Parent then
             T.items[meterObj] = {v = readObj(meterObj), born = t00, n = 0, hist = {}, lo = 9, hi = -9, manual = true}
         end
@@ -560,7 +570,6 @@ do
             if now - T.lastScan > 0.08 then T:scan(now) end
             T:update(now)
 
-            -- thanh lực đã học mà không hề đổi -> bỏ, dò lại
             if State.meterLearned and meterObj and el > 1.2 then
                 local it = T.items[meterObj]
                 if it and it.n == 0 then
@@ -582,14 +591,12 @@ do
                         released, vRel, rateRel = true, s.v, rate
                         break
                     elseif rising and s.v >= 0.6 then
-                        -- đang tăng: đoán trước độ trễ bấm-thả, thả ở khung hình gần 100% nhất
                         local pred = s.v + rate * lead
                         if pred >= goal - rate * fdt * 0.5 then
                             released, vRel, rateRel = true, s.v, rate
                             break
                         end
                     end
-                    -- đang giảm (vòng đã qua đỉnh) -> không thả, đợi vòng sau
                 end
             end
             if el >= CFG.MaxCharge then break end
@@ -607,7 +614,7 @@ do
                 RunService.RenderStepped:Wait()
                 local v = readObj(active)
                 if v then
-                    if lastVal and v < lastVal - 0.25 then break end -- bị reset về 0 sau khi thả
+                    if lastVal and v < lastVal - 0.25 then break end
                     if lastVal and math.abs(v - lastVal) > 1e-4 then lastChange = os.clock() end
                     lastVal, finalV = v, v
                 end
@@ -618,7 +625,6 @@ do
             if CFG.AutoLead and finalV and finalV >= 0.3 and rateRel > 0.3 then
                 local newLead = CFG.Lead
                 if lastChange then
-                    -- từ lúc thả tới lúc số ngừng đổi = độ trễ thật
                     local L = lastChange - tUp
                     if L > 0.003 and L < 0.25 then newLead = CFG.Lead * 0.6 + L * 0.4 end
                 elseif finalV < goal - 0.02 then
@@ -629,7 +635,6 @@ do
             end
         end
 
-        -- tự học thanh lực: nhãn đổi >= 6 lần và chạy rộng >= 40% -> nhớ lại cho các lượt sau
         if released and active and activeS and active.Parent and (not meterObj or State.meterLearned)
             and activeS.n >= 6 and (activeS.hi - activeS.lo) >= 0.4 then
             if meterObj ~= active then log("[LỰC] đã học thanh lực: " .. active:GetFullName()) end
@@ -646,22 +651,47 @@ do
         end
         return released
     end
-end
 
--- Khi người dùng tự chọn thanh lực (trong InputBegan, chỗ  meterObj, pickMode, State.meterLearned = chosen, false, false)
--- đổi thành:   meterObj, pickMode, State.meterLearned = chosen, false, false
+    -- Giữ chuột cố định HoldTime giây rồi nhả (mặc định)
+    function holdThrow(manual)
+        State.holding = true
+        local x, y
+        local ok, res = pcall(function()
+            if CFG.FixedHold then
+                x, y = pickClickPoint()
+                mouseBtn(x, y, false) -- đảm bảo chuột đang nhả trước khi bấm
+                pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
+                task.wait(0.05)
+                mouseBtn(x, y, true)
+                local t0 = os.clock()
+                while State.Running and (CFG.AutoThrow or manual) and os.clock() - t0 < CFG.HoldTime do
+                    RunService.RenderStepped:Wait()
+                end
+                mouseBtn(x, y, false)
+                log(("[THROW] giữ %.2fs rồi nhả"):format(os.clock() - t0))
+                return true
+            end
+            return holdMeter(manual)
+        end)
+        if not ok then
+            log("[LOI giữ] " .. tostring(res))
+            if x then mouseBtn(x, y, false) end
+        end
+        State.holding = false
+        return ok and res
+    end
+end
 
 ------------------------------------------------------------------
 -- MÁY BAY (chỉ nhận máy bay CỦA MÌNH)
 ------------------------------------------------------------------
 local inFlight, baseY, planeCache, reachedGate = false, nil, nil, false
-local flightStart = 0
 local lastPlaneScan = 0
 local throwStartT = 0
 local findPlane
 
 do
-    local spawnInfo = setmetatable({}, {__mode = "k"}) -- inst -> {t, d}
+    local spawnInfo = setmetatable({}, {__mode = "k"})
     local OWNER_KEYS = {"OwnerUserId", "Owner", "UserId", "OwnerId", "Player", "PlayerName"}
 
     local function recordSpawn(v, part)
@@ -821,6 +851,16 @@ local function pickGate()
     return best
 end
 
+-- Tọa độ bay do người dùng đặt
+local function wpTarget()
+    if CFG.UseWaypoint and CFG.WpSet then return Vector3.new(CFG.WpX, CFG.WpY, CFG.WpZ) end
+    return nil
+end
+local function setWaypoint(v)
+    CFG.WpX, CFG.WpY, CFG.WpZ, CFG.WpSet = v.X, v.Y, v.Z, true
+    saveCfg()
+end
+
 -- Lực nâng + đẩy tiến
 local thrustAtt, thrustForce
 local function clearThrust()
@@ -835,11 +875,15 @@ local function ensureThrust(r)
         RelativeTo = Enum.ActuatorRelativeTo.World, ApplyAtCenterOfMass = true, Force = Vector3.zero}, r)
 end
 
--- Raycast kiểm tra vật cản (bỏ qua kẹo / coin / cổng / vật trong suốt)
+------------------------------------------------------------------
+-- RADAR VẬT CẢN (theo Aircraft Radar): tia thẳng + 2 tia sát 2 bên + dò làn trống
+------------------------------------------------------------------
 local avoidParams = RaycastParams.new()
 avoidParams.FilterType = Enum.RaycastFilterType.Exclude
 avoidParams.IgnoreWater = true
-local DG = {dir = 0, untilT = 0, lat = 0, ahead = nil, climb = 0, lastScan = 0, base = {}}
+local DG = {dir = 0, untilT = 0, lat = 0, ahead = nil, climb = 0, lastScan = 0, base = {},
+    obs = nil, obsDist = nil, hdiff = nil, shift = 0}
+local radarHL
 
 local function refreshAvoidFilter()
     local list = {}
@@ -847,6 +891,10 @@ local function refreshAvoidFilter()
     if planeCache then list[#list + 1] = planeCache end
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= lp and p.Character then list[#list + 1] = p.Character end
+    end
+    -- máy bay khác có tag "Aircraft" (như Script 1) không tính là vật cản cố định
+    for _, m in ipairs(CollectionService:GetTagged("Aircraft")) do
+        if m ~= planeCache then list[#list + 1] = m end
     end
     DG.base = list
     avoidParams.FilterDescendantsInstances = list
@@ -864,6 +912,14 @@ do
         return false
     end
 
+    local function topOf(i)
+        local cf, sz = i.CFrame, i.Size
+        local halfY = math.abs(cf.RightVector.Y) * sz.X * 0.5
+            + math.abs(cf.UpVector.Y) * sz.Y * 0.5
+            + math.abs(cf.LookVector.Y) * sz.Z * 0.5
+        return i.Position.Y + halfY
+    end
+
     local function cast(origin, vec, radius)
         if radius and radius > 0.5 then
             local ok, res = pcall(function() return workspace:Spherecast(origin, radius, vec, avoidParams) end)
@@ -877,7 +933,7 @@ do
         return workspace:Raycast(origin, vec, avoidParams)
     end
 
-    -- trả về kết quả cast đầu tiên là vật chắn THẬT (bỏ qua kẹo/coin/cổng/trong suốt rồi cast tiếp)
+    -- kết quả cast đầu tiên là vật chắn THẬT (bỏ qua kẹo/coin/cổng/trong suốt/vật thấp hơn đáy máy bay)
     function blockingHit(origin, vec, radius, planeBottom)
         local filt
         for _ = 1, 12 do
@@ -885,14 +941,8 @@ do
             if not res then break end
             local i = res.Instance
             local lowEnough = false
-            -- Vật có đỉnh thấp hơn đáy máy bay không phải vật cản: bỏ qua để bay thẳng.
             if planeBottom and i:IsA("BasePart") then
-                local cf, sz = i.CFrame, i.Size
-                local halfY = math.abs(cf.RightVector.Y) * sz.X * 0.5
-                    + math.abs(cf.UpVector.Y) * sz.Y * 0.5
-                    + math.abs(cf.LookVector.Y) * sz.Z * 0.5
-                local topY = i.Position.Y + halfY
-                lowEnough = topY <= planeBottom - 0.75
+                lowEnough = topOf(i) <= planeBottom - 0.75 -- chênh cao < 0: bay qua được
             end
             local ghost = lowEnough or ((not i:IsA("Terrain")) and
                 (i == curGate or i.Transparency >= 0.95 or not (i.CanCollide or i.CanTouch) or isIgnoredName(i)))
@@ -908,26 +958,25 @@ do
         return nil
     end
 
-    -- 7 làn song song phía trước (cách nhau theo bề ngang máy bay), mỗi làn là 1 spherecast
-    local LANES = {-4, -2.2, -1, 0, 1, 2.2, 4}
-    local function laneShift(free, offs, from, to, step, look)
-        for j = from, to, step do
-            if free[j] >= look - 1 then return math.abs(offs[j]), true end
+    local PROBES = {6, 12, 25, 50, 90, 150} -- khoảng lệch ngang thử tìm làn trống (stud)
+    local function probe(pos, side, sgn, dir, look, R, planeBottom)
+        for _, dist in ipairs(PROBES) do
+            if not blockingHit(pos + side * sgn * dist, dir * look, R, planeBottom) then return dist end
         end
-        return math.abs(offs[to]), false
+        return nil
     end
 
     function updateDodge(pos, dir, speed, plane)
-        if not CFG.AvoidObstacles then DG.dir, DG.lat, DG.climb = 0, 0, 0; return 0 end
+        if not CFG.AvoidObstacles then DG.dir, DG.lat, DG.climb, DG.obs = 0, 0, 0, nil; return 0 end
         local now = os.clock()
         if now - DG.lastScan < CFG.ScanRate then return DG.dir end
         DG.lastScan = now
         local look = math.clamp(CFG.ScanDist + speed * CFG.ScanTime, 25, 1000)
         local R = CFG.PlaneRadius
-        local c = R + 3
+        local S = CFG.SideScan
         local side = Vector3.new(-dir.Z, 0, dir.X)
-        -- Tính đáy máy bay theo kích thước và góc nghiêng hiện tại, không chỉ lấy Size.Y.
-        local planeBottom = pos.Y
+
+        local planeBottom
         if plane and plane:IsA("BasePart") then
             local cf, sz = plane.CFrame, plane.Size
             local halfY = math.abs(cf.RightVector.Y) * sz.X * 0.5
@@ -937,54 +986,61 @@ do
         else
             planeBottom = pos.Y - R
         end
-        local offs, free = {}, {}
-        for i, k in ipairs(LANES) do
-            offs[i] = k * c
-            local res = blockingHit(pos + side * offs[i], dir * look, R, planeBottom)
-            free[i] = res and res.Distance or look
+
+        -- 3 tia: giữa + sát 2 bên (S stud mỗi bên)
+        local ahead, nearest = look, nil
+        for _, k in ipairs({-1, 0, 1}) do
+            local res = blockingHit(pos + side * S * k, dir * look, R, planeBottom)
+            if res then
+                if res.Distance < ahead then ahead = res.Distance end
+                if not nearest or res.Distance < nearest.Distance then nearest = res end
+            end
         end
-        local ahead = math.min(free[3], free[4], free[5])
         DG.ahead = ahead
-        if ahead < look - 1 then
-            local shR, clearR = laneShift(free, offs, 5, 7, 1, look)
-            local shL, clearL = laneShift(free, offs, 3, 1, -1, look)
-            local sl, sr = free[1] + free[2] + free[3], free[5] + free[6] + free[7]
-            local candidate
-            if clearR ~= clearL then candidate = clearR and 1 or -1
-            else candidate = (sr >= sl) and 1 or -1 end
-            -- Chống đảo lái: giữ bên đang né; chỉ đổi nếu bên kia thoáng hơn đáng kể.
-            local pick = candidate
-            if DG.dir ~= 0 and now < DG.untilT then
-                local currentScore = DG.dir > 0 and sr or sl
-                local otherScore = DG.dir > 0 and sl or sr
-                if otherScore < currentScore + math.max(look * 0.35, 35) then
-                    pick = DG.dir
-                else
-                    pick = candidate
+
+        if nearest then
+            DG.obs, DG.obsDist = nearest.Instance, nearest.Distance
+            DG.hdiff = nearest.Instance:IsA("BasePart") and (topOf(nearest.Instance) - planeBottom) or 0
+            if DG.dir == 0 or now >= DG.untilT then
+                local sr = probe(pos, side, 1, dir, look, R, planeBottom)
+                local sl = probe(pos, side, -1, dir, look, R, planeBottom)
+                local pick, shift
+                if sr and sl then
+                    pick, shift = (sr <= sl) and 1 or -1, math.min(sr, sl)
+                elseif sr then pick, shift = 1, sr
+                elseif sl then pick, shift = -1, sl
+                else pick, shift = (DG.dir ~= 0 and DG.dir or 1), PROBES[#PROBES] end
+                DG.climb = (not sr and not sl) and 1 or 0
+                if pick ~= DG.dir then
+                    log(("[NÉ] vật cản %s cách %d stud, chênh cao %.1f -> lái %s (làn trống cách %d)"):format(
+                        nearest.Instance.Name, math.floor(ahead), DG.hdiff, pick > 0 and "phải" or "trái", shift))
                 end
-            elseif DG.dir ~= 0 then
-                -- Hết khóa hướng: chỉ đổi bên nếu hướng cũ không còn lối thoát.
-                local oldClear = DG.dir > 0 and clearR or clearL
-                if oldClear then pick = DG.dir end
+                DG.dir, DG.shift, DG.untilT = pick, shift, now + 0.9
             end
-            if DG.dir == 0 or pick ~= DG.dir then
-                log(("[NÉ] vật cản cách %d stud (quét %d) -> lái %s"):format(
-                    math.floor(ahead), math.floor(look), pick > 0 and "phải" or "trái"))
-                DG.untilT = now + 0.9
-            end
-            DG.dir = pick
-            local shift = (pick == 1) and shR or shL
-            -- Giới hạn và làm mượt lực né để tránh giật ngang/đánh lái liên tục.
-            local wantedLat = math.clamp(shift * speed / math.max(ahead - R, 18) * 0.75, 12, math.min(CFG.DodgeSide, 65))
-            DG.lat = DG.lat == 0 and wantedLat or (DG.lat * 0.65 + wantedLat * 0.35)
-            DG.climb = (not clearR and not clearL) and 1 or 0
+            local wanted = math.clamp(DG.shift * speed / math.max(ahead - R, 18) * 0.75, 12, math.min(CFG.DodgeSide, 65))
+            DG.lat = DG.lat == 0 and wanted or (DG.lat * 0.65 + wanted * 0.35)
         else
+            DG.obs, DG.obsDist, DG.hdiff = nil, nil, nil
             DG.lat = DG.lat * 0.55
             if now > DG.untilT then DG.dir, DG.lat, DG.climb = 0, 0, 0 end
         end
         return DG.dir
     end
 end
+
+local function updateRadar()
+    if CFG.Radar and DG.obs and DG.obs.Parent then
+        if not radarHL then
+            radarHL = new("Highlight", {FillTransparency = 0.75, OutlineTransparency = 0,
+                DepthMode = Enum.HighlightDepthMode.AlwaysOnTop}, gui)
+        end
+        local col = (DG.hdiff or 0) < 0 and Color3.fromRGB(0, 255, 60) or Color3.fromRGB(255, 35, 35)
+        radarHL.Adornee, radarHL.FillColor, radarHL.OutlineColor = DG.obs, col, col
+    elseif radarHL then
+        radarHL.Adornee = nil
+    end
+end
+
 ------------------------------------------------------------------
 -- LÁI BẰNG PHÍM GIẢ LẬP (A/D hoặc ←/→)
 ------------------------------------------------------------------
@@ -1016,6 +1072,20 @@ local function setSteer(s)
     end
 end
 
+-- Lái tới tọa độ đã đặt
+local function updateWaypoint(pos, dir)
+    local tgt = wpTarget()
+    if not tgt then return 0 end
+    local d = tgt - pos
+    local flat = Vector3.new(d.X, 0, d.Z)
+    local right = Vector3.new(-dir.Z, 0, dir.X)
+    local lat = flat:Dot(right)
+    local ahead = flat:Dot(dir)
+    local dead = math.max(6, flat.Magnitude * 0.04)
+    if lat > dead then return 1 elseif lat < -dead then return -1 end
+    if ahead < 0 then return lat >= 0 and 1 or -1 end -- tọa độ ở sau lưng: bẻ lái quay lại
+    return 0
+end
 
 -- KẸO
 local CANDY_KW = {"candy", "kẹo", "lolli", "sweet", "sugar"}
@@ -1178,7 +1248,7 @@ do
                     if m.last == nil then changed = true
                     elseif type(cur) == "number" then changed = math.abs(cur - m.last) > 0.01
                     else changed = (cur - m.last).Magnitude > 0.01 end
-                    if changed then m.orig = cur end -- game vừa ghi giá trị mới -> lấy làm gốc
+                    if changed then m.orig = cur end
                     m.last = m.orig * mult
                     inst[prop] = m.last
                 end)
@@ -1207,7 +1277,6 @@ do
         State.lastPos = pos
         State.actual = actual
 
-        -- đo tốc độ gốc ở 0.35s đầu khi máy bay thật sự chuyển động
         if not State.speedStart then
             if hs > 5 then State.speedStart = now; speedRef = hs end
             return
@@ -1236,7 +1305,6 @@ do
             r.AssemblyLinearVelocity = Vector3.new(heading.X * target, v.Y, heading.Z * target)
         end
 
-        -- chế độ tự động: không ăn thì chuyển mover -> ghi đè vận tốc -> dịch CFrame
         if mode == 0 and mult >= 2 and now - State.speedStart > 0.9 then
             if actual < speedRef * mult * 0.6 then
                 State.bad = (State.bad or 0) + dt
@@ -1257,7 +1325,6 @@ do
         end
     end
 
-    -- ghi ở Stepped = ngay trước bước vật lý, sau mọi script RenderStepped của game
     bind(RunService.Stepped:Connect(function(_, dt)
         if not (CFG.SpeedBoost and inFlight and not reachedGate) then return end
         local r = State.pr
@@ -1274,6 +1341,7 @@ local function flightStep()
         if thrustForce then clearThrust() end
         if steerState ~= 0 then setSteer(0) end
         State.pr = nil
+        if radarHL then radarHL.Adornee = nil end
         return
     end
     local r = planeRoot()
@@ -1297,11 +1365,27 @@ local function flightStep()
         if dir.Magnitude < 0.1 then dir = Vector3.new(0, 0, -1) end
         dir = dir.Unit
     end
-    State.pr, State.dir = r, dir -- để bước Stepped tăng tốc dùng
+    State.pr, State.dir = r, dir
+
+    -- tới tọa độ đã đặt
+    local wp = wpTarget()
+    if wp then
+        local d = wp - pos
+        State.wpDist = Vector3.new(d.X, 0, d.Z).Magnitude
+        if State.wpDist <= CFG.WpRadius then
+            reachedGate = true
+            clearThrust()
+            setSteer(0)
+            notify("Tọa độ", "Đã tới tọa độ đã đặt")
+            return
+        end
+    else
+        State.wpDist = nil
+    end
 
     if curGate and curGate.Parent then
         local d = curGate.Position - pos
-        if Vector3.new(d.X, 0, d.Z).Magnitude <= GATE_STOP + curGate.Size.Magnitude / 4 then
+        if Vector3.new(d.X, 0, d.Z).Magnitude <= 30 + curGate.Size.Magnitude / 4 then
             reachedGate = true
             clearThrust()
             setSteer(0)
@@ -1316,7 +1400,8 @@ local function flightStep()
     if CFG.KeepFlying and not r.Anchored and r ~= root() then
         ensureThrust(r)
         local g = workspace.Gravity
-        local wantY = baseY + CFG.HoldHeight + (DG.climb == 1 and 40 or 0)
+        local holdY = (wp and CFG.WpFollowY) and wp.Y or (baseY + CFG.HoldHeight)
+        local wantY = holdY + (DG.climb == 1 and 60 or 0)
         local up = g + math.clamp((wantY - pos.Y) * 6, -g * 0.8, CFG.Lift)
         local push = speed < CFG.FlySpeed and CFG.Push or 0
         thrustForce.Force = Vector3.new(dir.X * push, up, dir.Z * push) * r.AssemblyMass
@@ -1328,13 +1413,16 @@ local function flightStep()
         State.lastFilter = now
         refreshAvoidFilter()
     end
-    -- dùng tốc độ thực đo được (khi đang dịch CFrame thì vận tốc không phản ánh đúng)
     local sp = math.max(speed, State.actual or 0)
     local d = updateDodge(pos, dir, sp, r)
-    local c = (d == 0) and updateCandy(pos, dir) or 0
+    updateRadar()
+    local c = 0
+    if d == 0 then
+        c = updateCandy(pos, dir)
+        if c == 0 then c = updateWaypoint(pos, dir) end
+    end
     setSteer(d ~= 0 and d or c)
 
-    -- né chủ động: đẩy thân máy bay sang ngang ngay, không chờ máy bay tự bẻ lái theo phím
     if d ~= 0 and CFG.DodgeAssist and DG.lat > 1 and not r.Anchored and r ~= root() then
         local side = Vector3.new(-dir.Z, 0, dir.X)
         r.CFrame = r.CFrame + side * d * DG.lat * dt
@@ -1349,10 +1437,11 @@ bind(RunService.Heartbeat:Connect(function()
 end))
 
 ------------------------------------------------------------------
--- FAM LỰC
+-- FAM LỰC + MỞ KHÓA + x2 SỨC MẠNH
 ------------------------------------------------------------------
+local findUnlocks
+do
 local UNLOCK_KW = {"mở khóa", "mở khoá", "mo khoa", "unlock"}
-local FARM_KW = {"fam lực", "farm lực", "fam luc", "farm luc", "farm power", "power farm", "luyện lực", "luyen luc", "tập lực", "fam sức", "farm sức"}
 local SUF = {k = 1e3, m = 1e6, b = 1e9, t = 1e12}
 
 local function parseMult(s)
@@ -1382,7 +1471,7 @@ local function collectTexts(root_)
     return table.concat(t, " ")
 end
 
-local function findUnlocks()
+function findUnlocks()
     local res, seen = {}, {}
     local function add(key, u)
         if not key or seen[key] then return end
@@ -1420,8 +1509,45 @@ local function findUnlocks()
     table.sort(res, function(a, b) return a.mult > b.mult end)
     return res
 end
+end
 
-local farmStatus, lastUnlockCheck, lastUnlockPart, lastUnlockTime = "tắt", 0, nil, 0
+local farmStatus, lastUnlockCheck, lastUnlockPart, lastUnlockMult = "tắt", 0, nil, 0
+
+local function standingOn(part)
+    local r = root()
+    if not (r and part and part.Parent) then return false end
+    local d = r.Position - part.Position
+    local radius = math.max(10, math.max(part.Size.X, part.Size.Z) / 2 + 4)
+    return Vector3.new(d.X, 0, d.Z).Magnitude <= radius and math.abs(d.Y) <= part.Size.Y / 2 + 14
+end
+
+-- Chọn khu Mở khóa có hệ số cao nhất: đang đứng ở khu cao nhất thì ở yên, ngược lại tele tới đó
+local function unlockBest(force)
+    local list = findUnlocks()
+    local best = list[1]
+    if not best then farmStatus = "không thấy khu Mở khóa"; return nil end
+    if not force then
+        for _, u in ipairs(list) do
+            if u.mult < best.mult then break end
+            if standingOn(u.part) then
+                lastUnlockPart, lastUnlockMult = u.part, u.mult
+                farmStatus = ("đang đứng khu cao nhất x%s"):format(abbr(u.mult))
+                return u
+            end
+        end
+    end
+    local r = root()
+    if r then
+        r.CFrame = best.part.CFrame + Vector3.new(0, best.part.Size.Y / 2 + 3, 0)
+        log(("[FARM] tele tới khu %s x%s"):format(best.name, abbr(best.mult)))
+    end
+    lastUnlockPart, lastUnlockMult = best.part, best.mult
+    farmStatus = ("đã tele tới khu x%s"):format(abbr(best.mult))
+    return best
+end
+
+local clickX2Strength
+do
 local x2ClickState = setmetatable({}, {__mode = "k"})
 
 local function cleanGuiText(value)
@@ -1432,7 +1558,6 @@ end
 
 local function isX2StrengthText(value)
     local t = cleanGuiText(value)
-    -- Nhận cả cách viết có/không dấu và các cách đảo vị trí thường gặp.
     local strength = t:find("x2 sức mạnh", 1, true)
         or t:find("x2 suc manh", 1, true)
         or t:find("sức mạnh x2", 1, true)
@@ -1443,42 +1568,14 @@ local function isX2StrengthText(value)
     return strength ~= nil and power == nil
 end
 
-local function guiTextTree(obj, depth)
-    local out, seen = {}, 0
-    if not obj then return "" end
-    local function addText(o)
-        if o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox") then
-            out[#out + 1] = o.Text
-        end
-        out[#out + 1] = o.Name
-    end
-    addText(obj)
-    local ok, descendants = pcall(function() return obj:GetDescendants() end)
-    if ok then
-        for _, child in ipairs(descendants) do
-            if seen >= 60 then break end
-            if child:IsA("GuiObject") and child.Visible then
-                addText(child)
-                seen += 1
-            end
-        end
-    end
-    return cleanGuiText(table.concat(out, " "))
-end
-
 local function circleClickTarget(labelObj)
-    -- Ưu tiên nút bấm thật; nếu chữ nằm đè trên ImageLabel/Frame hình tròn,
-    -- tìm tổ tiên gần nhất có kích thước gần vuông để bấm đúng tâm vòng tròn.
     local p, best, bestScore = labelObj, nil, math.huge
     local depth = 0
     while p and p:IsA("GuiObject") and depth < 7 do
         local size = p.AbsoluteSize
         if size.X >= 24 and size.Y >= 24 and size.X <= 360 and size.Y <= 360 then
-            local ratio = size.X / math.max(size.Y, 1)
-            local squareError = math.abs(1 - ratio)
-            if p:IsA("GuiButton") then
-                return p
-            end
+            local squareError = math.abs(1 - size.X / math.max(size.Y, 1))
+            if p:IsA("GuiButton") then return p end
             if squareError <= 0.38 then
                 local score = squareError * 100 + depth * 0.5
                 if score < bestScore then best, bestScore = p, score end
@@ -1490,74 +1587,63 @@ local function circleClickTarget(labelObj)
     return best or labelObj
 end
 
-local function clickX2Strength()
+-- Click tâm vòng tròn "x2 sức mạnh" (bù GuiInset để đúng tọa độ màn hình)
+function clickX2Strength()
     local pg = lp:FindFirstChildOfClass("PlayerGui")
-    if not pg then return end
+    if not pg then return false end
 
-    -- Xóa trạng thái khi vòng tròn/nút đã biến mất hoặc bị ẩn để lần xuất hiện sau được nhấn lại.
     for obj in pairs(x2ClickState) do
         if not obj.Parent or not visibleChain(obj) then x2ClickState[obj] = nil end
     end
 
     for _, v in ipairs(pg:GetDescendants()) do
-        if v:IsA("GuiObject") and visibleChain(v) then
-            local directText = ""
-            if v:IsA("TextLabel") or v:IsA("TextButton") or v:IsA("TextBox") then
-                directText = cleanGuiText(v.Text .. " " .. v.Name)
-            else
-                directText = cleanGuiText(v.Name)
-            end
-
-            local hasTarget = isX2StrengthText(directText)
-            -- Một số UI đặt chữ ở ngoài vòng tròn hoặc tách thành nhiều TextLabel,
-            -- vì vậy kiểm tra thêm cây GUI của Frame/ImageButton bao quanh.
-            if not hasTarget and (v:IsA("Frame") or v:IsA("ImageButton") or v:IsA("ImageLabel") or v:IsA("TextButton")) then
-                hasTarget = isX2StrengthText(guiTextTree(v, 2))
-            end
-
-            if hasTarget then
-                local hit = circleClickTarget(v)
-                if hit and hit.Parent and visibleChain(hit) then
-                    local state = x2ClickState[hit]
-                    if not state then state = {tries = 0, last = 0}; x2ClickState[hit] = state end
-                    if state.tries < 3 and os.clock() - state.last >= 0.85 then
-                        local size, pos = hit.AbsoluteSize, hit.AbsolutePosition
-                        if size.X > 0 and size.Y > 0 then
-                            local x, y = pos.X + size.X * 0.5, pos.Y + size.Y * 0.5
-                            -- Dùng cùng đường giả lập chuột với Auto Ném; nhấn và nhả ngay tại tâm vòng tròn.
-                            pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
-                            mouseBtn(x, y, true)
-                            task.wait(0.055)
-                            mouseBtn(x, y, false)
-                            state.tries += 1
-                            state.last = os.clock()
-                            log(("[FARM] click vòng tròn x2 sức mạnh (%d/3)"):format(state.tries))
-                            return
+        if (v:IsA("TextLabel") or v:IsA("TextButton") or v:IsA("TextBox")) and v.Visible
+            and isX2StrengthText(v.Text) and visibleChain(v) then
+            local hit = circleClickTarget(v)
+            if hit and hit.Parent and visibleChain(hit) then
+                local state = x2ClickState[hit]
+                if not state then state = {tries = 0, last = 0}; x2ClickState[hit] = state end
+                if state.tries < 3 and os.clock() - state.last >= 0.6 then
+                    local size, pos = hit.AbsoluteSize, hit.AbsolutePosition
+                    if size.X > 0 and size.Y > 0 then
+                        local sg = hit:FindFirstAncestorWhichIsA("ScreenGui")
+                        local inset = (sg and sg.IgnoreGuiInset) and 0 or GuiService:GetGuiInset().Y
+                        local x, y = pos.X + size.X * 0.5, pos.Y + size.Y * 0.5 + inset
+                        pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
+                        mouseBtn(x, y, true)
+                        task.wait(0.055)
+                        mouseBtn(x, y, false)
+                        if state.tries >= 1 and hit:IsA("GuiButton") and type(firesignal) == "function" then
+                            pcall(firesignal, hit.MouseButton1Click)
+                            pcall(firesignal, hit.Activated)
                         end
+                        state.tries += 1
+                        state.last = os.clock()
+                        log(("[X2] click vòng tròn x2 sức mạnh (%d/3) tại %d,%d"):format(state.tries, math.floor(x), math.floor(y)))
+                        return true
                     end
                 end
             end
         end
     end
+    return false
+end
 end
 
 local function farmTick()
-    if os.clock() - lastUnlockCheck > 8 then
+    if os.clock() - lastUnlockCheck > CFG.UnlockRecheck then
         lastUnlockCheck = os.clock()
         pcall(unlockBest)
-    else
-        local u = lastUnlockPart
-        if u and u.Parent then
-            local r = root()
-            if r then
-                local cf = u.CFrame + Vector3.new(0, u.Size.Y / 2 + 3, 0)
-                local d = r.Position - cf.Position
-                if Vector3.new(d.X, 0, d.Z).Magnitude > 10 or math.abs(d.Y) > 15 then r.CFrame = cf end
-            end
-        end
     end
-    pcall(clickX2Strength) -- click tâm vòng tròn x2 sức mạnh bằng cùng cơ chế Auto Ném; bỏ qua x2 Power
 end
+
+-- Auto x2 sức mạnh chạy độc lập, không phụ thuộc Fam lực (tạm dừng khi đang giữ chuột ném)
+task.spawn(function()
+    while State.Running do
+        task.wait(0.3)
+        if CFG.AutoX2 and not State.holding then pcall(clickX2Strength) end
+    end
+end)
 
 ------------------------------------------------------------------
 -- VÒNG LẶP NÉM
@@ -1579,10 +1665,11 @@ local function throwOnce()
     DG.dir, DG.untilT, DG.lat, DG.climb, DG.lastScan = 0, 0, 0, 0, 0
     releaseKeys()
 
+    task.wait(CFG.ReadyDelay) -- chờ game sẵn sàng sau khi tele/đáp, giúp giữ chuột trơn tru như bấm tay
+
     throwStartT = os.clock()
     holdThrow()
     throws += 1
-    flightStart = os.clock()
     inFlight = true
 
     local t0 = os.clock()
@@ -1598,7 +1685,7 @@ local function throwOnce()
 
         if ended then reason = "server báo kết thúc"; break end
         if elapsed >= CFG.MaxFlight then reason = "quá thời gian bay"; break end
-        if reachedGate then reason = "chạm cổng"; break end
+        if reachedGate then reason = "tới đích"; break end
 
         if (CFG.SteerRemote or State.remoteSteer) and Remote and flightId then
             pcall(function() Remote:FireServer("Steer", flightId, CFG.SteerInvert and -steerState or steerState, CFG.SteerY) end)
@@ -1659,6 +1746,7 @@ task.spawn(function()
         if CFG.AutoThrow then
             if CFG.FarmPower then
                 local t0 = os.clock()
+                lastUnlockCheck = 0 -- vào đợt fam: kiểm tra lại khu cao nhất ngay
                 while State.Running and CFG.AutoThrow and CFG.FarmPower and os.clock() - t0 < CFG.FarmTime do
                     pcall(farmTick)
                     task.wait(0.5)
@@ -1667,6 +1755,7 @@ task.spawn(function()
             if CFG.AutoThrow then
                 local ok, err = pcall(throwOnce)
                 if not ok then log("[LOI] " .. tostring(err)); mouseBtn(0, 0, false) end
+                State.holding = false
                 inFlight = false
                 clearThrust()
                 releaseKeys()
@@ -2010,7 +2099,7 @@ local function playIndex(i)
 end
 
 ------------------------------------------------------------------
--- GIAO DIỆN (trong hàm riêng để không vượt giới hạn 200 local của Luau)
+-- GIAO DIỆN
 ------------------------------------------------------------------
 local function buildUI()
 blur = new("BlurEffect", {Size = CFG.Blur and 14 or 0}, Lighting)
@@ -2183,13 +2272,16 @@ end
 local pThrow = addTab("Auto Ném", "🛩")
 status = infoLabel(pThrow, 46)
 State.throwToggle = toggle(pThrow, "Auto Ném máy bay", "AutoThrow")
-infoLabel(pThrow, 70).Text = "Giữ chuột, chỉ theo dõi % MỚI hiện sau khi bấm, đoán trước để thả đúng 100%.\nMáy bay đáp -> bấm màn hình 1 lần -> rồi mới giữ ném tiếp."
-button(pThrow, "🎯 Chọn thanh lực (bấm vào nó trong game)", function()
-    pickMode = true
-    notify("Thanh lực", "Giờ hãy bấm vào thanh/chữ % lực trong game")
-end)
+infoLabel(pThrow, 58).Text = "Giữ chuột đúng số giây đặt bên dưới rồi nhả (mặc định 1 giây).\nMáy bay đáp -> bấm màn hình 1 lần -> rồi mới giữ ném tiếp."
+toggle(pThrow, "Giữ cố định (tắt = dùng thanh lực)", "FixedHold")
+stepper(pThrow, "Giữ chuột (giây)", "HoldTime", 0.05, 0.2, 5, 2)
+stepper(pThrow, "Chờ trước khi giữ (giây)", "ReadyDelay", 0.1, 0, 3, 1)
 button(pThrow, "🖱 Test giữ chuột (1 lần)", function()
     task.spawn(function() holdThrow(true) end)
+end, Color3.fromRGB(45, 55, 105))
+button(pThrow, "🎯 Chọn thanh lực (chỉ khi tắt giữ cố định)", function()
+    pickMode = true
+    notify("Thanh lực", "Giờ hãy bấm vào thanh/chữ % lực trong game")
 end, Color3.fromRGB(45, 55, 105))
 button(pThrow, "🧹 Quên thanh lực đã học/chọn", function()
     meterObj, State.meterLearned = nil, false
@@ -2204,7 +2296,7 @@ stepper(pThrow, "Giữ khi mất thanh lực", "ChargeHold", 0.1, 0.3, 5, 1)
 stepper(pThrow, "Nghỉ giữa lần ném", "Between", 0.25, 0.5, 10, 2)
 stepper(pThrow, "Bay tối đa (giây)", "MaxFlight", 5, 10, 300, 0)
 stepper(pThrow, "Đứng yên = đã đáp (giây)", "StillTime", 0.5, 0.5, 10, 1)
-stepper(pThrow, "Đợi sau khi chạm cổng", "GateWait", 1, 2, 60, 0)
+stepper(pThrow, "Đợi sau khi tới đích", "GateWait", 1, 2, 60, 0)
 stepper(pThrow, "Bán kính không tele", "TeleRadius", 5, 5, 100, 0)
 stepper(pThrow, "Lệch Y điểm bấm chuột", "ClickOffY", 10, -150, 150, 0)
 stepper(pThrow, "Máy bay sinh cách mình (stud)", "PlaneSpawnDist", 10, 10, 300, 0)
@@ -2219,18 +2311,22 @@ end)
 
 -- Tab Bay
 local pFly = addTab("Bay", "🚀")
-flyInfo = infoLabel(pFly, 70)
+flyInfo = infoLabel(pFly, 100)
 toggle(pFly, "Xuyên vật thể khi bay", "NoclipPlane")
 toggle(pFly, "Lực nâng + đẩy tiến", "KeepFlying")
 toggle(pFly, "Tăng tốc máy bay (ghi đè)", "SpeedBoost")
-stepper(pFly, "Hệ số tốc độ (5 = 500%)", "SpeedMult", 0.5, 1, 30, 1)
+stepper(pFly, "Hệ số tốc độ (50 = tối đa)", "SpeedMult", 1, 1, 50, 0)
 stepper(pFly, "Kiểu tốc: 0 tự,1 mover,2 vận tốc,3 CF", "SpeedMode", 1, 0, 3, 0, function()
     State.cfMode, State.velMode = false, false
 end)
 toggle(pFly, "Tự né vật cản (giữ phím lái)", "AvoidObstacles")
+toggle(pFly, "Radar: tô màu vật cản phía trước", "Radar", function(on)
+    if not on and radarHL then radarHL.Adornee = nil end
+end)
 toggle(pFly, "Né chủ động (đẩy ngang máy bay)", "DodgeAssist")
 stepper(pFly, "Né: đẩy ngang tối đa (stud/s)", "DodgeSide", 25, 25, 800, 0)
-stepper(pFly, "Bề ngang máy bay (stud)", "PlaneRadius", 1, 2, 20, 0)
+stepper(pFly, "Quét 2 bên (stud mỗi bên)", "SideScan", 0.5, 0.5, 20, 1)
+stepper(pFly, "Bề ngang máy bay (stud)", "PlaneRadius", 0.5, 0.5, 20, 1)
 stepper(pFly, "Quét trước (stud)", "ScanDist", 5, 5, 300, 0)
 stepper(pFly, "Quét thêm theo tốc độ (s)", "ScanTime", 0.1, 0, 3, 2)
 toggle(pFly, "Lái tới kẹo (đường thoáng)", "AutoCandy")
@@ -2242,7 +2338,7 @@ stepper(pFly, "Phím lái (1=A/D, 2=←/→)", "SteerKeys", 1, 1, 2, 0)
 toggle(pFly, "Đảo trái/phải phím lái", "SteerInvert")
 toggle(pFly, "Gửi thêm remote Steer", "SteerRemote")
 stepper(pFly, "Độ cao giữ (stud)", "HoldHeight", 5, -20, 100, 0)
-stepper(pFly, "Tốc độ tối đa (lực đẩy)", "FlySpeed", 20, 50, 1000, 0)
+stepper(pFly, "Tốc độ tối đa (lực đẩy)", "FlySpeed", 50, 50, 1000, 0)
 stepper(pFly, "Lực đẩy trước", "Push", 10, 10, 300, 0)
 stepper(pFly, "Lực nâng lên", "Lift", 5, 0, 120, 0)
 button(pFly, "🔍 Quét lại cổng", function()
@@ -2257,17 +2353,69 @@ button(pFly, "🔁 Đổi cổng (thử cổng khác)", function()
     notify("Cổng", gates[gateOverride].Name .. " (" .. gateOverride .. "/" .. #gates .. ")")
 end)
 
+-- Tab Tọa độ
+local pWp = addTab("Tọa độ", "🧭")
+wpInfo = infoLabel(pWp, 46)
+toggle(pWp, "Bay tới tọa độ đã đặt", "UseWaypoint")
+toggle(pWp, "Giữ độ cao theo Y của tọa độ", "WpFollowY")
+button(pWp, "📍 Đặt tọa độ = vị trí hiện tại", function()
+    local r = (inFlight and planeRoot()) or root()
+    if r then
+        setWaypoint(r.Position)
+        notify("Tọa độ", ("Đã đặt %d, %d, %d"):format(r.Position.X, r.Position.Y, r.Position.Z))
+    end
+end)
+button(pWp, "🚪 Đặt tọa độ = cổng đang chọn", function()
+    if #gates == 0 then scanGates() end
+    local g = curGate or gates[gateOverride or 1]
+    if g and g.Parent then
+        setWaypoint(g.Position)
+        notify("Tọa độ", "Đặt tại " .. g.Name)
+    else
+        notify("Tọa độ", "Không thấy cổng")
+    end
+end, Color3.fromRGB(45, 55, 105))
+local wpBox = new("TextBox", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = Color3.fromRGB(35, 40, 70),
+    PlaceholderText = "Nhập tọa độ: X, Y, Z rồi Enter", Text = "", TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.Gotham, TextSize = 13, ClearTextOnFocus = false}, pWp)
+new("UICorner", {CornerRadius = UDim.new(0, 8)}, wpBox)
+wpBox.FocusLost:Connect(function(enter)
+    if not enter then return end
+    local nums = {}
+    for n in wpBox.Text:gmatch("%-?%d+%.?%d*") do nums[#nums + 1] = tonumber(n) end
+    if #nums >= 3 then
+        setWaypoint(Vector3.new(nums[1], nums[2], nums[3]))
+        notify("Tọa độ", ("Đã đặt %d, %d, %d"):format(nums[1], nums[2], nums[3]))
+    else
+        notify("Tọa độ", "Nhập đủ 3 số X, Y, Z")
+    end
+end)
+stepper(pWp, "Bán kính coi là tới (stud)", "WpRadius", 5, 5, 500, 0)
+button(pWp, "🗑 Xóa tọa độ", function()
+    CFG.WpSet, CFG.UseWaypoint = false, false
+    saveCfg()
+    notify("Tọa độ", "Đã xóa (tắt bay tới tọa độ)")
+end, Color3.fromRGB(150, 70, 70))
+infoLabel(pWp, 58).Text = "Đứng ở nơi muốn bay tới, bấm 'Đặt tọa độ', bật 'Bay tới tọa độ'.\nKhi bay, máy bay tự lái tới đó; vật cản vẫn được né trước, tới nơi thì kết thúc lượt."
+
 -- Tab Fam lực
 local pFarm = addTab("Fam lực", "💪")
 farmInfo = infoLabel(pFarm, 46)
 toggle(pFarm, "Auto fam lực (chọn xN cao nhất + teleport)", "FarmPower")
 stepper(pFarm, "Ở chỗ fam (giây/vòng)", "FarmTime", 1, 2, 120, 0)
+stepper(pFarm, "Kiểm tra lại khu cao nhất (s)", "UnlockRecheck", 1, 1, 60, 0)
+toggle(pFarm, "Auto nhấn x2 sức mạnh khi hiện", "AutoX2")
+button(pFarm, "🖱 Test nhấn x2 sức mạnh ngay", function()
+    task.spawn(function()
+        notify("x2 sức mạnh", clickX2Strength() and "Đã nhấn" or "Không thấy vòng tròn x2 sức mạnh")
+    end)
+end, Color3.fromRGB(45, 55, 105))
 toggle(pFarm, "Auto tái sinh (Rebirth)", "AutoRebirth")
 stepper(pFarm, "Tái sinh mỗi (giây)", "RebirthEvery", 1, 1, 120, 0)
 button(pFarm, "♻ Tái sinh ngay 1 lần", function()
     notify("Rebirth", doRebirth() and "Đã gửi lệnh tái sinh" or "Không thấy remote Rebirth")
 end, Color3.fromRGB(45, 55, 105))
-infoLabel(pFarm, 54).Text = "Tự quét các khu vực 'Mở khóa', chọn hệ số xN cao nhất rồi teleport đến đó.\nTự nhấn x2 sức mạnh khi xuất hiện; bỏ qua x2 Power. Khu vực phóng chỉ dùng cho Auto Ném."
+infoLabel(pFarm, 66).Text = "Quét các khu 'Mở khóa', chọn hệ số xN cao nhất. Đang đứng ở khu cao nhất thì ở yên; có khu cao hơn thì tele tới.\nx2 sức mạnh tự nhấn (bỏ qua x2 Power). Khu vực phóng chỉ dùng cho Auto Ném."
 button(pFarm, "↩ Teleport đến khu Mở khóa xN cao nhất", function()
     local u = unlockBest(true)
     if not u then notify("Fam lực", "Không tìm thấy khu vực Mở khóa có hệ số") end
@@ -2281,12 +2429,6 @@ button(pFarm, "🔍 Quét 'Mở khóa' (xem log)", function()
             log(("[MỞ KHÓA] #%d %s x%s"):format(i, u.name, tostring(u.mult)))
         end
         notify("Mở khóa", ("Thấy %d, cao nhất x%s"):format(#list, tostring(list[1].mult)))
-    end)
-end)
-button(pFarm, "🎯 Chọn + teleport khu Mở khóa cao nhất", function()
-    task.spawn(function()
-        local u = unlockBest(true)
-        if u then notify("Mở khóa", "Đã teleport đến " .. u.name .. " (x" .. tostring(u.mult) .. ")") else notify("Mở khóa", "Không thấy khu vực 'Mở khóa'") end
     end)
 end)
 
@@ -2411,10 +2553,10 @@ task.spawn(function()
         pcall(function()
             local gained = getCoins() - startCoins
             local hrs = (os.clock() - State.t0) / 3600
-            status.Text = ("Ném: %d | Coin +%s (%s/giờ) | Vị trí: %s\nThanh lực: %s | Lực cuối: %s"):format(
+            status.Text = ("Ném: %d | Coin +%s (%s/giờ) | Vị trí: %s\nGiữ: %s | Lực cuối: %s"):format(
                 throws, abbr(gained), abbr(hrs > 0.003 and gained / hrs or 0),
                 (zoneCache and zoneCache.Parent and "Khu vực phóng ✓") or (throwSpot and "đã lưu") or "chưa",
-                lastMeterName and ("✓ " .. lastMeterName) or "chưa thấy",
+                CFG.FixedHold and (CFG.HoldTime .. "s cố định") or "theo thanh lực",
                 lastPower and string.format("%.0f%%", lastPower * 100) or "-")
             local pr = inFlight and planeRoot()
             local dist = ""
@@ -2422,15 +2564,22 @@ task.spawn(function()
                 local d = curGate.Position - pr.Position
                 dist = (" | còn %d stud"):format(math.floor(Vector3.new(d.X, 0, d.Z).Magnitude))
             end
-            flyInfo.Text = ("Cổng: %s (%d vật khớp)%s\nTrạng thái: %s\nBay: %s | Lái: %d | né: %d (cách %s)\nTốc: %s | thực %d stud/s"):format(
+            local obsTxt = "không"
+            if DG.obs and DG.obs.Parent then
+                obsTxt = ("%s cách %d, chênh cao %.1f (%s)"):format(DG.obs.Name, math.floor(DG.obsDist or 0), DG.hdiff or 0,
+                    (DG.hdiff or 0) < 0 and "bay qua" or "né")
+            end
+            flyInfo.Text = ("Cổng: %s (%d vật khớp)%s\nTrạng thái: %s\nBay: %s | Lái: %d | né: %d | tọa độ: %s\nTốc: %s | thực %d stud/s\nVật cản: %s"):format(
                 curGate and curGate.Name or "chưa chọn", #gates, dist,
-                reachedGate and "đã chạm cổng" or (inFlight and "đang bay" or "chờ ném"),
+                reachedGate and "đã tới đích" or (inFlight and "đang bay" or "chờ ném"),
                 (planeCache and planeCache.Parent) and planeCache.Name or "chưa nhận",
-                steerState, DG.dir, DG.ahead and tostring(math.floor(DG.ahead)) or "-",
+                steerState, DG.dir, (CFG.UseWaypoint and CFG.WpSet) and (State.wpDist and ("còn " .. math.floor(State.wpDist)) or "đã đặt") or "tắt",
                 State.cfMode and "CFrame" or (State.velMode and "vận tốc" or "mover"),
-                math.floor(State.actual or 0))
+                math.floor(State.actual or 0), obsTxt)
+            wpInfo.Text = CFG.WpSet and ("Tọa độ: %d, %d, %d\nBay tới tọa độ: %s"):format(CFG.WpX, CFG.WpY, CFG.WpZ, CFG.UseWaypoint and "BẬT" or "tắt")
+                or "Chưa đặt tọa độ."
             farmInfo.Text = "Fam lực: " .. (CFG.FarmPower and farmStatus or "tắt") ..
-                "\nKhu vực: " .. ((lastUnlockPart and lastUnlockPart.Parent and lastUnlockPart.Name) or "chưa chọn")
+                "\nKhu vực: " .. ((lastUnlockPart and lastUnlockPart.Parent and (lastUnlockPart.Name .. " x" .. abbr(lastUnlockMult))) or "chưa chọn")
             nowPlaying.Text = "♪ " .. Music.CurrentName .. (MusicSound.Playing and "  (đang phát)" or "  (tạm dừng)")
             local n, tail = #logs, {}
             for i = math.max(1, n - 11), n do tail[#tail + 1] = logs[i] end
@@ -2459,10 +2608,11 @@ getgenv().PPHubUnload = function()
     if CFG.NoFog then restoreLight("fog") end
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     MusicCleanup()
+    pcall(function() if radarHL then radarHL:Destroy() end end)
     pcall(function() blur:Destroy() end)
     pcall(function() gui:Destroy() end)
     getgenv().PPHubUnload = nil
 end
 
 if CFG.AutoExecute then queueAutoExec() end
-notify("H-HUB", "Đã tải v5.0. Bật Auto Ném (hoặc phím K); nếu không thấy thanh lực hãy bấm 'Chọn thanh lực'.")
+notify("H-HUB", "Đã tải v6.0. Bật Auto Ném (hoặc phím K) - giữ chuột 1 giây rồi nhả.")
