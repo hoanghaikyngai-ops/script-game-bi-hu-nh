@@ -1,13 +1,12 @@
---// H-HUB | Paper Plane Hub v6.0
---// So với v5.0:
---//  * Auto Ném: giữ chuột đúng HoldTime (mặc định 1 giây) rồi nhả, không quét thanh lực nữa (tắt "Giữ cố định" để dùng lại thanh lực)
---//  * Quét vật cản viết lại theo Aircraft Radar: raycast thẳng phía trước + 2 tia sát 2 bên (1 stud), chênh cao vật cản,
---//    dò làn trống bên trái/phải, tô đỏ vật cản (Radar)
---//  * Tọa độ bay: đặt tọa độ -> máy bay tự lái tới đó, vẫn tự né vật cản
---//  * Tốc độ máy bay đặt mức tối đa
---//  * Fam lực: sửa tele (hàm unlockBest bị thiếu), đứng đúng khu cao nhất thì ở yên, có khu cao hơn thì tele lại
---//  * Auto nhấn x2 sức mạnh chạy độc lập, click đúng tọa độ (có bù GuiInset)
---//  Phím tắt: F = bay, J = xuyên vật thể, K = bật/tắt Auto Ném, LeftCtrl = ẩn/hiện bảng
+--// H-HUB | Paper Plane Hub v7.0 (+ Vá bổ sung P1->P5)
+--// Bản vá từ v6.0 (E1 -> E11) + P1 -> P5:
+--//  * Lộ trình tọa độ đặt sẵn (click map / nhập X,Y,Z / vị trí hiện tại) + đường nối + tia dẫn đường
+--//  * ESP đỏ vật cản trong dải độ cao (10000 stud, BoxHandleAdornment, chạy cả khi chưa ném)
+--//  * Máy bay của mình tô xanh (Highlight) + Radar vật cản
+--//  * Quạt 9 tia phía trước (10 stud, ±40 độ) + né khi cách mũi 5 stud + 2 đường thẳng sát 2 bên (4 stud)
+--//  * Khóa cứng nhân vật khi Auto Ném + Remote tăng tốc tự nhập ($id, $mult) + tự lái tới cổng sau lộ trình
+--//  * Đo lực có hiệu chuẩn thời gian (CalTime) & quét nhãn % ở cả PlayerGui lẫn workspace (BillboardGui/SurfaceGui)
+--//  Phím tắt: F = bay, J = xuyên vật thể, K = bật/tắt Auto Ném, L = chụp nhãn % vào Log, LeftCtrl = ẩn/hiện bảng
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -55,6 +54,11 @@ local CFG = {
     PlaneSpawnDist = 40,
     FixedHold = true, HoldTime = 1, ReadyDelay = 0.5,
     Radar = true,
+    LockPlayer = true, ObsESP = true, EspRange = 10000, EspMax = 300, EspBand = 6,
+    Route = "", UseRoute = true, RouteRadius = 30, RouteShow = true, RouteLift = 10,
+    FanLen = 10, FanAngle = 40, AvoidDist = 5, AvoidTime = 0, SideOff = 4, SideLen = 12,
+    SteerGate = true, MaxForce = true, CalTime = 0, PreferCal = false,
+    BoostRemote = "", BoostArgs = "", BoostEvery = 0.25,
     UseWaypoint = false, WpSet = false, WpX = 0, WpY = 0, WpZ = 0, WpRadius = 40, WpFollowY = true,
 }
 
@@ -95,6 +99,12 @@ if (CFG.CfgVer or 0) < 60 then
     CFG.CfgVer = 60
 end
 if CFG.Lead > 0.25 or CFG.Lead < 0 then CFG.Lead = 0.06 end
+if (CFG.CfgVer or 0) < 70 then
+    CFG.FixedHold = false          -- dùng đo lực thật thay vì giữ 1 giây
+    CFG.MaxFlight = 300
+    CFG.Push, CFG.Lift, CFG.FlySpeed = 300, 120, 1000
+    CFG.CfgVer = 70
+end
 
 local function new(cls, props, parent)
     local o = Instance.new(cls)
@@ -367,8 +377,8 @@ local function visibleChain(o)
         if not p.Visible then return false end
         p = p.Parent
     end
-    local sg = o:FindFirstAncestorWhichIsA("ScreenGui")
-    return (not sg) or sg.Enabled
+    local lc = o:FindFirstAncestorWhichIsA("LayerCollector") -- ScreenGui / BillboardGui / SurfaceGui
+    return (not lc) or lc.Enabled
 end
 
 local function readObj(o)
@@ -431,8 +441,33 @@ local function tapScreen()
     mouseBtn(x, y, false)
 end
 
+local guiPool
 local holdThrow
 do
+local pool, poolSet, poolAt, poolHooked = {}, {}, -10, false
+local function poolAdd(d)
+    if (d:IsA("TextLabel") or d:IsA("TextButton")) and not poolSet[d] then
+        poolSet[d] = true
+        pool[#pool + 1] = d
+    end
+end
+function guiPool(force)
+    local now = os.clock()
+    if force or now - poolAt > 6 then
+        poolAt = now
+        pool, poolSet = {}, {}
+        local pg = lp:FindFirstChildOfClass("PlayerGui")
+        if pg then for _, d in ipairs(pg:GetDescendants()) do poolAdd(d) end end
+        for _, d in ipairs(workspace:GetDescendants()) do poolAdd(d) end
+        if not poolHooked then
+            poolHooked = true
+            if pg then bind(pg.DescendantAdded:Connect(poolAdd)) end
+            bind(workspace.DescendantAdded:Connect(poolAdd))
+        end
+    end
+    return pool
+end
+
 local METER_KW = {"power", "charge", "lực", "luc", "force", "meter", "strength", "throw"}
 
 local function nameHas(inst)
@@ -460,18 +495,14 @@ end
             return (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text:find("%d%s*%%") ~= nil and visibleChain(o)
         end
         function T:snapshot()
-            local pg = lp:FindFirstChildOfClass("PlayerGui")
-            if not pg then return end
-            for _, o in ipairs(pg:GetDescendants()) do
-                if isPctLabel(o) then self.base[o] = o.Text end
+            for _, o in ipairs(guiPool(true)) do
+                if o.Parent and isPctLabel(o) then self.base[o] = o.Text end
             end
         end
         function T:scan(now)
-            local pg = lp:FindFirstChildOfClass("PlayerGui")
-            if not pg then return end
             self.lastScan = now
-            for _, o in ipairs(pg:GetDescendants()) do
-                if not self.items[o] and not self.ignored[o] and isPctLabel(o) then
+            for _, o in ipairs(guiPool()) do
+                if o.Parent and not self.items[o] and not self.ignored[o] and isPctLabel(o) then
                     if self.base[o] == nil or self.base[o] ~= o.Text then
                         self.items[o] = {v = readObj(o), born = now, n = 0, hist = {}, lo = 9, hi = -9, pure = pctOnly(o.Text)}
                     end
@@ -605,6 +636,8 @@ end
         end
         mouseBtn(x, y, false)
         local tUp = os.clock()
+        State.relTime = released and (tUp - t0) or nil
+        State.relPow = vRel
 
         local finalV, lastChange = lastV, nil
         if released and active and active.Parent then
@@ -652,26 +685,36 @@ end
         return released
     end
 
-    -- Giữ chuột cố định HoldTime giây rồi nhả (mặc định)
     function holdThrow(manual)
         State.holding = true
         local x, y
-        local ok, res = pcall(function()
-            if CFG.FixedHold then
-                x, y = pickClickPoint()
-                mouseBtn(x, y, false) -- đảm bảo chuột đang nhả trước khi bấm
-                pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
-                task.wait(0.05)
-                mouseBtn(x, y, true)
-                local t0 = os.clock()
-                while State.Running and (CFG.AutoThrow or manual) and os.clock() - t0 < CFG.HoldTime do
-                    RunService.RenderStepped:Wait()
-                end
-                mouseBtn(x, y, false)
-                log(("[THROW] giữ %.2fs rồi nhả"):format(os.clock() - t0))
-                return true
+        local function timed(sec, tag)
+            x, y = pickClickPoint()
+            mouseBtn(x, y, false)
+            pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
+            task.wait(0.05)
+            mouseBtn(x, y, true)
+            local t0 = os.clock()
+            while State.Running and (CFG.AutoThrow or manual) and os.clock() - t0 < sec do
+                RunService.RenderStepped:Wait()
             end
-            return holdMeter(manual)
+            mouseBtn(x, y, false)
+            log(("[THROW] %s: giữ %.3fs rồi nhả"):format(tag, os.clock() - t0))
+            return true
+        end
+        local ok, res = pcall(function()
+            if CFG.FixedHold then return timed(CFG.HoldTime, "cố định") end
+            local hasMeter = meterObj and meterObj.Parent
+            if CFG.CalTime > 0 and (CFG.PreferCal or not hasMeter) then
+                return timed(CFG.CalTime, "hiệu chuẩn")
+            end
+            local rel = holdMeter(manual)
+            if rel and State.relTime and (State.relPow or 0) >= CFG.PowerGoal - 0.03 then
+                CFG.CalTime = CFG.CalTime > 0 and (CFG.CalTime * 0.5 + State.relTime * 0.5) or State.relTime
+                saveCfg()
+                log(("[LỰC] hiệu chuẩn: %.3fs để đạt ~100%%"):format(CFG.CalTime))
+            end
+            return rel
         end)
         if not ok then
             log("[LOI giữ] " .. tostring(res))
@@ -851,8 +894,113 @@ local function pickGate()
     return best
 end
 
--- Tọa độ bay do người dùng đặt
+-- Lộ trình tọa độ đặt sẵn + tia dẫn đường
+local Route = {pts = {}, idx = 1}
+local routeFolder, guidePart
+
+local function routeSave()
+    local t = {}
+    for _, v in ipairs(Route.pts) do t[#t + 1] = ("%.1f,%.1f,%.1f"):format(v.X, v.Y, v.Z) end
+    CFG.Route = table.concat(t, ";")
+    saveCfg()
+end
+local function routeLoad()
+    Route.pts = {}
+    for chunk in tostring(CFG.Route):gmatch("[^;]+") do
+        local x, y, z = chunk:match("(%-?[%d%.]+),(%-?[%d%.]+),(%-?[%d%.]+)")
+        if x then Route.pts[#Route.pts + 1] = Vector3.new(tonumber(x), tonumber(y), tonumber(z)) end
+    end
+end
+
+local function routeLine(a, b, color, thick)
+    local total = (b - a).Magnitude
+    if total < 0.5 then return end
+    local dir, done = (b - a).Unit, 0
+    while done < total do
+        local seg = math.min(2000, total - done)
+        local p0, p1 = a + dir * done, a + dir * (done + seg)
+        new("Part", {Name = "Line", Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+            CastShadow = false, Material = Enum.Material.Neon, Color = color,
+            Size = Vector3.new(thick, thick, seg), CFrame = CFrame.lookAt((p0 + p1) / 2, p1)}, routeFolder)
+        done += seg
+    end
+end
+
+local function routeDraw()
+    if routeFolder and routeFolder.Parent then routeFolder:ClearAllChildren()
+    else routeFolder = new("Folder", {Name = "HHubRoute"}, workspace) end
+    if Route.info then
+        Route.info.Text = (#Route.pts == 0) and "Chưa có điểm nào." or
+            ("Lộ trình: %d điểm (đang tới điểm %d). Điểm cuối xong -> máy bay tự lái tới cổng."):format(#Route.pts, math.min(Route.idx, #Route.pts))
+    end
+    if not CFG.RouteShow then return end
+    local prev
+    for i, p in ipairs(Route.pts) do
+        local m = new("Part", {Name = "Node", Shape = Enum.PartType.Ball, Size = Vector3.one * 6, Anchored = true,
+            CanCollide = false, CanQuery = false, CanTouch = false, CastShadow = false, Material = Enum.Material.Neon,
+            Color = Color3.fromRGB(255, 220, 0), Position = p}, routeFolder)
+        local bb = new("BillboardGui", {Size = UDim2.fromOffset(60, 24), AlwaysOnTop = true, StudsOffset = Vector3.new(0, 5, 0)}, m)
+        new("TextLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = tostring(i),
+            TextColor3 = Color3.new(1, 1, 0), TextStrokeTransparency = 0, Font = Enum.Font.GothamBlack, TextSize = 18}, bb)
+        if prev then routeLine(prev, p, Color3.fromRGB(0, 200, 255), 1.2) end
+        prev = p
+    end
+end
+
+local function routeAdd(v)
+    Route.pts[#Route.pts + 1] = v
+    routeSave(); routeDraw()
+    notify("Lộ trình", ("Điểm %d: %d, %d, %d"):format(#Route.pts, v.X, v.Y, v.Z))
+end
+local function routeUndo()
+    table.remove(Route.pts); Route.idx = 1
+    routeSave(); routeDraw()
+end
+local function routeClear()
+    Route.pts, Route.idx = {}, 1
+    routeSave(); routeDraw()
+end
+
+-- tia dẫn đường từ máy bay tới điểm đang nhắm
+local function updateGuide(a, b)
+    if not (a and b and CFG.RouteShow) then
+        if guidePart then guidePart.Transparency = 1 end
+        return
+    end
+    if not (guidePart and guidePart.Parent) then
+        routeFolder = (routeFolder and routeFolder.Parent) and routeFolder or new("Folder", {Name = "HHubRoute"}, workspace)
+        guidePart = new("Part", {Name = "Guide", Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+            CastShadow = false, Material = Enum.Material.Neon, Color = Color3.fromRGB(80, 255, 120)}, routeFolder)
+    end
+    local v = b - a
+    local len = v.Magnitude
+    if len < 1 then guidePart.Transparency = 1 return end
+    len = math.min(len, 2000)
+    local e = a + v.Unit * len
+    guidePart.Transparency = 0.2
+    guidePart.Size = Vector3.new(0.6, 0.6, len)
+    guidePart.CFrame = CFrame.lookAt((a + e) / 2, e)
+end
+
+-- click lên map để thêm điểm (bật bằng nút ở tab Lộ trình)
+bind(UserInputService.InputBegan:Connect(function(input, processed)
+    if not State.pickRoute or processed then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local inset = GuiService:GetGuiInset()
+    local ray = cam:ViewportPointToRay(input.Position.X, input.Position.Y + inset.Y)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = {lp.Character, routeFolder}
+    local res = workspace:Raycast(ray.Origin, ray.Direction * 5000, rp)
+    if res then routeAdd(res.Position + Vector3.new(0, CFG.RouteLift, 0))
+    else notify("Lộ trình", "Không trúng gì, thử lại") end
+end))
+
+-- Tọa độ bay do người dùng đặt (điểm lộ trình có ưu tiên)
 local function wpTarget()
+    if CFG.UseRoute and Route.idx <= #Route.pts then return Route.pts[Route.idx] end
     if CFG.UseWaypoint and CFG.WpSet then return Vector3.new(CFG.WpX, CFG.WpY, CFG.WpZ) end
     return nil
 end
@@ -876,13 +1024,13 @@ local function ensureThrust(r)
 end
 
 ------------------------------------------------------------------
--- RADAR VẬT CẢN (theo Aircraft Radar): tia thẳng + 2 tia sát 2 bên + dò làn trống
+-- RADAR VẬT CẢN: quạt phía trước + 2 đường thẳng sát 2 bên + ESP đỏ
 ------------------------------------------------------------------
 local avoidParams = RaycastParams.new()
 avoidParams.FilterType = Enum.RaycastFilterType.Exclude
 avoidParams.IgnoreWater = true
 local DG = {dir = 0, untilT = 0, lat = 0, ahead = nil, climb = 0, lastScan = 0, base = {},
-    obs = nil, obsDist = nil, hdiff = nil, shift = 0}
+    obs = nil, obsDist = nil, hdiff = nil, shift = 0, vetoL = false, vetoR = false}
 local radarHL
 
 local function refreshAvoidFilter()
@@ -958,80 +1106,100 @@ do
         return nil
     end
 
-    local PROBES = {6, 12, 25, 50, 90, 150} -- khoảng lệch ngang thử tìm làn trống (stud)
-    local function probe(pos, side, sgn, dir, look, R, planeBottom)
-        for _, dist in ipairs(PROBES) do
-            if not blockingHit(pos + side * sgn * dist, dir * look, R, planeBottom) then return dist end
-        end
-        return nil
+    local function halfYOf(i)
+        local cf, sz = i.CFrame, i.Size
+        return math.abs(cf.RightVector.Y) * sz.X * 0.5 + math.abs(cf.UpVector.Y) * sz.Y * 0.5
+            + math.abs(cf.LookVector.Y) * sz.Z * 0.5
     end
 
     function updateDodge(pos, dir, speed, plane)
-        if not CFG.AvoidObstacles then DG.dir, DG.lat, DG.climb, DG.obs = 0, 0, 0, nil; return 0 end
+        if not CFG.AvoidObstacles then
+            DG.dir, DG.lat, DG.climb, DG.obs, DG.vetoL, DG.vetoR = 0, 0, 0, nil, false, false
+            return 0
+        end
         local now = os.clock()
         if now - DG.lastScan < CFG.ScanRate then return DG.dir end
         DG.lastScan = now
-        local look = math.clamp(CFG.ScanDist + speed * CFG.ScanTime, 25, 1000)
-        local R = CFG.PlaneRadius
-        local S = CFG.SideScan
-        local side = Vector3.new(-dir.Z, 0, dir.X)
 
-        local planeBottom
+        local halfLen, planeBottom = 3, pos.Y - CFG.PlaneRadius
         if plane and plane:IsA("BasePart") then
-            local cf, sz = plane.CFrame, plane.Size
-            local halfY = math.abs(cf.RightVector.Y) * sz.X * 0.5
-                + math.abs(cf.UpVector.Y) * sz.Y * 0.5
-                + math.abs(cf.LookVector.Y) * sz.Z * 0.5
-            planeBottom = pos.Y - halfY
-        else
-            planeBottom = pos.Y - R
+            halfLen = math.max(plane.Size.X, plane.Size.Z) / 2
+            planeBottom = pos.Y - halfYOf(plane)
         end
+        local nose = pos + dir * halfLen                 -- mũi máy bay: gốc của quạt, "5 stud" tính từ đây
+        local side = Vector3.new(-dir.Z, 0, dir.X)       -- bên phải
+        local trigger = CFG.AvoidDist + speed * CFG.AvoidTime
+        local fanLen = math.max(CFG.FanLen, trigger + 1)
 
-        -- 3 tia: giữa + sát 2 bên (S stud mỗi bên)
-        local ahead, nearest = look, nil
-        for _, k in ipairs({-1, 0, 1}) do
-            local res = blockingHit(pos + side * S * k, dir * look, R, planeBottom)
+        -- quạt phía trước (9 tia, góc ±FanAngle). a>0 = lệch trái
+        local nearest, leftMin, rightMin = nil, fanLen, fanLen
+        local N, ang = 9, math.rad(CFG.FanAngle)
+        for i = 0, N - 1 do
+            local a = -ang + (2 * ang) * i / (N - 1)
+            local v = CFrame.fromAxisAngle(Vector3.yAxis, a):VectorToWorldSpace(dir)
+            local res = blockingHit(nose, v * fanLen, 0, planeBottom)
             if res then
-                if res.Distance < ahead then ahead = res.Distance end
-                if not nearest or res.Distance < nearest.Distance then nearest = res end
+                local d = res.Distance
+                if not nearest or d < nearest.Distance then nearest = res end
+                if a >= -1e-6 then leftMin = math.min(leftMin, d) end
+                if a <= 1e-6 then rightMin = math.min(rightMin, d) end
             end
         end
-        DG.ahead = ahead
 
+        -- 2 đường THẲNG song song sát 2 bên (không phải quạt)
+        local sl = blockingHit(pos - side * CFG.SideOff, dir * CFG.SideLen, 0, planeBottom)
+        local sr = blockingHit(pos + side * CFG.SideOff, dir * CFG.SideLen, 0, planeBottom)
+        DG.vetoL, DG.vetoR = sl ~= nil, sr ~= nil        -- cấm bẻ lái vào phía có vật chặn
+
+        DG.ahead = nearest and nearest.Distance or fanLen
         if nearest then
             DG.obs, DG.obsDist = nearest.Instance, nearest.Distance
             DG.hdiff = nearest.Instance:IsA("BasePart") and (topOf(nearest.Instance) - planeBottom) or 0
-            if DG.dir == 0 or now >= DG.untilT then
-                local sr = probe(pos, side, 1, dir, look, R, planeBottom)
-                local sl = probe(pos, side, -1, dir, look, R, planeBottom)
-                local pick, shift
-                if sr and sl then
-                    pick, shift = (sr <= sl) and 1 or -1, math.min(sr, sl)
-                elseif sr then pick, shift = 1, sr
-                elseif sl then pick, shift = -1, sl
-                else pick, shift = (DG.dir ~= 0 and DG.dir or 1), PROBES[#PROBES] end
-                DG.climb = (not sr and not sl) and 1 or 0
-                if pick ~= DG.dir then
-                    log(("[NÉ] vật cản %s cách %d stud, chênh cao %.1f -> lái %s (làn trống cách %d)"):format(
-                        nearest.Instance.Name, math.floor(ahead), DG.hdiff, pick > 0 and "phải" or "trái", shift))
-                end
-                DG.dir, DG.shift, DG.untilT = pick, shift, now + 0.9
-            end
-            local wanted = math.clamp(DG.shift * speed / math.max(ahead - R, 18) * 0.75, 12, math.min(CFG.DodgeSide, 65))
-            DG.lat = DG.lat == 0 and wanted or (DG.lat * 0.65 + wanted * 0.35)
         else
             DG.obs, DG.obsDist, DG.hdiff = nil, nil, nil
+        end
+
+        if nearest and nearest.Distance <= trigger then
+            if DG.dir == 0 or now >= DG.untilT then
+                local pick
+                if sl and not sr then pick = 1
+                elseif sr and not sl then pick = -1
+                else pick = (leftMin > rightMin) and -1 or 1 end   -- -1 = trái, 1 = phải
+                DG.climb = (sl and sr) and 1 or 0
+                if pick ~= DG.dir then
+                    log(("[NÉ] %s cách mũi %.1f stud -> lái %s (2 bên: T=%s P=%s)"):format(
+                        nearest.Instance.Name, nearest.Distance, pick > 0 and "phải" or "trái", tostring(sl ~= nil), tostring(sr ~= nil)))
+                end
+                DG.dir, DG.untilT = pick, now + 0.35
+            end
+            DG.lat = math.min(CFG.DodgeSide, 65)
+        else
             DG.lat = DG.lat * 0.55
             if now > DG.untilT then DG.dir, DG.lat, DG.climb = 0, 0, 0 end
         end
+        -- đang né sang phía mà đường thẳng bên đó có vật -> đổi phía / dừng bẻ
+        if DG.dir == 1 and sr then DG.dir = sl and 0 or -1
+        elseif DG.dir == -1 and sl then DG.dir = sr and 0 or 1 end
         return DG.dir
     end
 end
 
+local planeHL
 local function updateRadar()
+    local pc = planeCache
+    if CFG.Radar and inFlight and pc and pc.Parent then
+        if not planeHL then
+            planeHL = new("Highlight", {FillTransparency = 0.55, OutlineTransparency = 0,
+                FillColor = Color3.fromRGB(0, 255, 80), OutlineColor = Color3.fromRGB(0, 255, 80),
+                DepthMode = Enum.HighlightDepthMode.AlwaysOnTop}, gui)
+        end
+        planeHL.Adornee = pc
+    elseif planeHL then
+        planeHL.Adornee = nil
+    end
     if CFG.Radar and DG.obs and DG.obs.Parent then
         if not radarHL then
-            radarHL = new("Highlight", {FillTransparency = 0.75, OutlineTransparency = 0,
+            radarHL = new("Highlight", {FillTransparency = 0.6, OutlineTransparency = 0,
                 DepthMode = Enum.HighlightDepthMode.AlwaysOnTop}, gui)
         end
         local col = (DG.hdiff or 0) < 0 and Color3.fromRGB(0, 255, 60) or Color3.fromRGB(255, 35, 35)
@@ -1040,6 +1208,66 @@ local function updateRadar()
         radarHL.Adornee = nil
     end
 end
+
+-- ESP đỏ vật cản trong dải độ cao máy bay, chạy cả khi CHƯA ném (dùng BoxHandleAdornment, không dính giới hạn 31 Highlight)
+local espBoxes = {}
+local function espClear()
+    for p, a in pairs(espBoxes) do pcall(function() a:Destroy() end) end
+    table.clear(espBoxes)
+end
+local ESP_IGN = {"candy", "kẹo", "lolli", "sweet", "sugar", "coin", "gate", "cổng", "finish"}
+local function espScan()
+    local r = root()
+    if not r then return end
+    local ref = (inFlight and planeCache and partFromPlane(planeCache)) or r
+    local origin = ref.Position
+    local y = origin.Y + (inFlight and 0 or CFG.HoldHeight)
+    local cand, n = {}, 0
+    for i, v in ipairs(workspace:GetDescendants()) do
+        if v:IsA("BasePart") and v.Anchored and v.CanCollide and v.Transparency < 0.95 and not v:IsA("Terrain") then
+            local sz = v.Size
+            if math.max(sz.X, sz.Y, sz.Z) >= 3
+                and not (lp.Character and v:IsDescendantOf(lp.Character))
+                and not (planeCache and v:IsDescendantOf(planeCache))
+                and not (routeFolder and v:IsDescendantOf(routeFolder)) then
+                local d = (v.Position - origin).Magnitude
+                if d <= CFG.EspRange then
+                    local cf = v.CFrame
+                    local hy = math.abs(cf.RightVector.Y) * sz.X * 0.5 + math.abs(cf.UpVector.Y) * sz.Y * 0.5
+                        + math.abs(cf.LookVector.Y) * sz.Z * 0.5
+                    if v.Position.Y - hy <= y + CFG.EspBand and v.Position.Y + hy >= y - CFG.EspBand then
+                        local nl = v.Name:lower()
+                        local pl = (v.Parent and v.Parent ~= workspace) and v.Parent.Name:lower() or ""
+                        local ign = false
+                        for _, k in ipairs(ESP_IGN) do
+                            if nl:find(k, 1, true) or pl:find(k, 1, true) then ign = true break end
+                        end
+                        if not ign then n += 1; cand[n] = {v, d} end
+                    end
+                end
+            end
+        end
+        if i % 4000 == 0 then task.wait() end
+    end
+    table.sort(cand, function(a, b) return a[2] < b[2] end)
+    local want = {}
+    for i = 1, math.min(n, CFG.EspMax) do want[cand[i][1]] = true end
+    for p, a in pairs(espBoxes) do
+        if not want[p] or not p.Parent then pcall(function() a:Destroy() end); espBoxes[p] = nil end
+    end
+    for p in pairs(want) do
+        if not espBoxes[p] then
+            espBoxes[p] = new("BoxHandleAdornment", {Adornee = p, Size = p.Size, AlwaysOnTop = true, ZIndex = 1,
+                Transparency = 0.55, Color3 = Color3.fromRGB(255, 40, 40)}, gui)
+        end
+    end
+end
+task.spawn(function()
+    while State.Running do
+        if CFG.ObsESP then pcall(espScan) else espClear() end
+        task.wait(3)
+    end
+end)
 
 ------------------------------------------------------------------
 -- LÁI BẰNG PHÍM GIẢ LẬP (A/D hoặc ←/→)
@@ -1073,8 +1301,8 @@ local function setSteer(s)
 end
 
 -- Lái tới tọa độ đã đặt
-local function updateWaypoint(pos, dir)
-    local tgt = wpTarget()
+local function updateWaypoint(pos, dir, override)
+    local tgt = override or wpTarget()
     if not tgt then return 0 end
     local d = tgt - pos
     local flat = Vector3.new(d.X, 0, d.Z)
@@ -1342,6 +1570,7 @@ local function flightStep()
         if steerState ~= 0 then setSteer(0) end
         State.pr = nil
         if radarHL then radarHL.Adornee = nil end
+        updateGuide()
         return
     end
     local r = planeRoot()
@@ -1367,12 +1596,19 @@ local function flightStep()
     end
     State.pr, State.dir = r, dir
 
-    -- tới tọa độ đã đặt
     local wp = wpTarget()
     if wp then
         local d = wp - pos
-        State.wpDist = Vector3.new(d.X, 0, d.Z).Magnitude
-        if State.wpDist <= CFG.WpRadius then
+        local flat = Vector3.new(d.X, 0, d.Z)
+        State.wpDist = flat.Magnitude
+        if CFG.UseRoute and Route.idx <= #Route.pts then
+            local passed = flat.Magnitude > 0.1 and flat.Unit:Dot(dir) < -0.2
+            if State.wpDist <= CFG.RouteRadius or (passed and State.wpDist < CFG.RouteRadius * 3) then
+                log(("[ROUTE] qua điểm %d/%d"):format(Route.idx, #Route.pts))
+                Route.idx += 1
+                wp = wpTarget()
+            end
+        elseif State.wpDist <= CFG.WpRadius then
             reachedGate = true
             clearThrust()
             setSteer(0)
@@ -1403,7 +1639,7 @@ local function flightStep()
         local holdY = (wp and CFG.WpFollowY) and wp.Y or (baseY + CFG.HoldHeight)
         local wantY = holdY + (DG.climb == 1 and 60 or 0)
         local up = g + math.clamp((wantY - pos.Y) * 6, -g * 0.8, CFG.Lift)
-        local push = speed < CFG.FlySpeed and CFG.Push or 0
+        local push = (CFG.MaxForce or speed < CFG.FlySpeed) and CFG.Push or 0
         thrustForce.Force = Vector3.new(dir.X * push, up, dir.Z * push) * r.AssemblyMass
     elseif thrustForce then
         clearThrust()
@@ -1417,11 +1653,18 @@ local function flightStep()
     local d = updateDodge(pos, dir, sp, r)
     updateRadar()
     local c = 0
+    local tgt = wp or ((CFG.SteerGate and curGate and curGate.Parent) and curGate.Position or nil)
     if d == 0 then
-        c = updateCandy(pos, dir)
-        if c == 0 then c = updateWaypoint(pos, dir) end
+        if wp then
+            c = updateWaypoint(pos, dir)
+        else
+            c = updateCandy(pos, dir)
+            if c == 0 and tgt then c = updateWaypoint(pos, dir, tgt) end
+        end
     end
+    if c == -1 and DG.vetoL then c = 0 elseif c == 1 and DG.vetoR then c = 0 end
     setSteer(d ~= 0 and d or c)
+    updateGuide(pos, tgt)
 
     if d ~= 0 and CFG.DodgeAssist and DG.lat > 1 and not r.Anchored and r ~= root() then
         local side = Vector3.new(-dir.Z, 0, dir.X)
@@ -1646,8 +1889,49 @@ task.spawn(function()
 end)
 
 ------------------------------------------------------------------
--- VÒNG LẶP NÉM
+-- KHÓA NHÂN VẬT + REMOTE TĂNG TỐC + VÒNG LẶP NÉM
 ------------------------------------------------------------------
+local locked = false
+local function lockPlayer(on)
+    local r, h = root(), humanoid()
+    if on then
+        if not r then return end
+        r.AssemblyLinearVelocity = Vector3.zero
+        r.Anchored = true
+        if h then h.WalkSpeed, h.JumpPower, h.JumpHeight = 0, 0, 0 end
+        pcall(function() require(lp.PlayerScripts:WaitForChild("PlayerModule", 1)):GetControls():Disable() end)
+        locked = true
+    else
+        if r then r.Anchored = false end
+        if h then h.WalkSpeed = CFG.LoopSpeed and CFG.WalkSpeed or 16; h.JumpPower = 50; h.JumpHeight = 7.2 end
+        pcall(function() require(lp.PlayerScripts:WaitForChild("PlayerModule", 1)):GetControls():Enable() end)
+        locked = false
+    end
+end
+
+local lastBoost = 0
+local function fireBoost()
+    if CFG.BoostRemote == "" or not folder then return end
+    local rm = folder:FindFirstChild(CFG.BoostRemote)
+    if not rm then return end
+    local args, n = {}, 0
+    for tok in CFG.BoostArgs:gmatch("[^,]+") do
+        tok = tok:match("^%s*(.-)%s*$")
+        local v
+        if tok == "$id" then v = flightId
+        elseif tok == "$mult" then v = CFG.SpeedMult
+        elseif tok == "true" then v = true
+        elseif tok == "false" then v = false
+        elseif tonumber(tok) then v = tonumber(tok)
+        else v = tok end
+        n += 1; args[n] = v
+    end
+    pcall(function()
+        if rm:IsA("RemoteFunction") then rm:InvokeServer(table.unpack(args, 1, n))
+        else rm:FireServer(table.unpack(args, 1, n)) end
+    end)
+end
+
 local function throwOnce()
     local cf = getThrowCFrame()
     if cf and root() and not nearSpot(cf) then
@@ -1664,6 +1948,8 @@ local function throwOnce()
     State.velMode, State.lastPos, State.actual, State.lastFilter = false, nil, 0, 0
     DG.dir, DG.untilT, DG.lat, DG.climb, DG.lastScan = 0, 0, 0, 0, 0
     releaseKeys()
+    Route.idx = 1
+    if CFG.LockPlayer then lockPlayer(true) end
 
     task.wait(CFG.ReadyDelay) -- chờ game sẵn sàng sau khi tele/đáp, giúp giữ chuột trơn tru như bấm tay
 
@@ -1689,6 +1975,10 @@ local function throwOnce()
 
         if (CFG.SteerRemote or State.remoteSteer) and Remote and flightId then
             pcall(function() Remote:FireServer("Steer", flightId, CFG.SteerInvert and -steerState or steerState, CFG.SteerY) end)
+        end
+        if CFG.BoostRemote ~= "" and now - lastBoost >= CFG.BoostEvery then
+            lastBoost = now
+            fireBoost()
         end
 
         local p = findPlane()
@@ -1761,6 +2051,8 @@ task.spawn(function()
                 releaseKeys()
                 task.wait(CFG.Between)
             end
+        elseif locked then
+            lockPlayer(false)
         end
     end
 end)
@@ -1921,6 +2213,7 @@ local function startFly()
 end
 
 bind(lp.CharacterAdded:Connect(function()
+    locked = false
     task.wait(0.5)
     if CFG.PFly then startFly() end
 end))
@@ -2274,6 +2567,10 @@ status = infoLabel(pThrow, 46)
 State.throwToggle = toggle(pThrow, "Auto Ném máy bay", "AutoThrow")
 infoLabel(pThrow, 58).Text = "Giữ chuột đúng số giây đặt bên dưới rồi nhả (mặc định 1 giây).\nMáy bay đáp -> bấm màn hình 1 lần -> rồi mới giữ ném tiếp."
 toggle(pThrow, "Giữ cố định (tắt = dùng thanh lực)", "FixedHold")
+toggle(pThrow, "Khóa cứng nhân vật khi Auto Ném", "LockPlayer", function(on) if not on and locked then lockPlayer(false) end end)
+toggle(pThrow, "Ưu tiên giờ hiệu chuẩn (bỏ qua thanh lực)", "PreferCal")
+button(pThrow, "♻ Xóa hiệu chuẩn lực", function() CFG.CalTime = 0; saveCfg(); notify("Lực", "Đã xóa, ném tới sẽ đo lại") end,
+    Color3.fromRGB(45, 55, 105))
 stepper(pThrow, "Giữ chuột (giây)", "HoldTime", 0.05, 0.2, 5, 2)
 stepper(pThrow, "Chờ trước khi giữ (giây)", "ReadyDelay", 0.1, 0, 3, 1)
 button(pThrow, "🖱 Test giữ chuột (1 lần)", function()
@@ -2314,6 +2611,8 @@ local pFly = addTab("Bay", "🚀")
 flyInfo = infoLabel(pFly, 100)
 toggle(pFly, "Xuyên vật thể khi bay", "NoclipPlane")
 toggle(pFly, "Lực nâng + đẩy tiến", "KeepFlying")
+toggle(pFly, "Lực đẩy luôn tối đa", "MaxForce")
+toggle(pFly, "Sau lộ trình: tự lái tới cổng", "SteerGate")
 toggle(pFly, "Tăng tốc máy bay (ghi đè)", "SpeedBoost")
 stepper(pFly, "Hệ số tốc độ (50 = tối đa)", "SpeedMult", 1, 1, 50, 0)
 stepper(pFly, "Kiểu tốc: 0 tự,1 mover,2 vận tốc,3 CF", "SpeedMode", 1, 0, 3, 0, function()
@@ -2325,10 +2624,12 @@ toggle(pFly, "Radar: tô màu vật cản phía trước", "Radar", function(on)
 end)
 toggle(pFly, "Né chủ động (đẩy ngang máy bay)", "DodgeAssist")
 stepper(pFly, "Né: đẩy ngang tối đa (stud/s)", "DodgeSide", 25, 25, 800, 0)
-stepper(pFly, "Quét 2 bên (stud mỗi bên)", "SideScan", 0.5, 0.5, 20, 1)
-stepper(pFly, "Bề ngang máy bay (stud)", "PlaneRadius", 0.5, 0.5, 20, 1)
-stepper(pFly, "Quét trước (stud)", "ScanDist", 5, 5, 300, 0)
-stepper(pFly, "Quét thêm theo tốc độ (s)", "ScanTime", 0.1, 0, 3, 2)
+stepper(pFly, "Né khi cách mũi (stud)", "AvoidDist", 0.5, 1, 100, 1)
+stepper(pFly, "Cộng thêm theo tốc độ (s)", "AvoidTime", 0.005, 0, 1, 3)
+stepper(pFly, "Quạt trước: dài (stud)", "FanLen", 1, 5, 100, 0)
+stepper(pFly, "Quạt trước: góc ± (độ)", "FanAngle", 5, 10, 80, 0)
+stepper(pFly, "2 bên: cách tâm (stud)", "SideOff", 0.5, 1, 20, 1)
+stepper(pFly, "2 bên: dài đường thẳng (stud)", "SideLen", 1, 4, 100, 0)
 toggle(pFly, "Lái tới kẹo (đường thoáng)", "AutoCandy")
 stepper(pFly, "Kẹo: lệch tối đa (stud)", "CandyLateral", 10, 20, 300, 0)
 stepper(pFly, "Kẹo: nhìn trước (stud)", "CandyAhead", 25, 50, 800, 0)
@@ -2337,6 +2638,22 @@ stepper(pFly, "Kẹo: vùng thẳng (stud)", "CandyDead", 1, 1, 30, 0)
 stepper(pFly, "Phím lái (1=A/D, 2=←/→)", "SteerKeys", 1, 1, 2, 0)
 toggle(pFly, "Đảo trái/phải phím lái", "SteerInvert")
 toggle(pFly, "Gửi thêm remote Steer", "SteerRemote")
+local bBox = new("TextBox", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = Color3.fromRGB(35, 40, 70),
+    PlaceholderText = "Tên remote tăng tốc (trong PaperPlaneRemotes)", Text = CFG.BoostRemote, TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.Gotham, TextSize = 12, ClearTextOnFocus = false}, pFly)
+new("UICorner", {CornerRadius = UDim.new(0, 8)}, bBox)
+bBox.FocusLost:Connect(function() CFG.BoostRemote = bBox.Text; saveCfg() end)
+local aBox = new("TextBox", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = Color3.fromRGB(35, 40, 70),
+    PlaceholderText = "Tham số, cách nhau dấu phẩy (dùng $id, $mult)", Text = CFG.BoostArgs, TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.Gotham, TextSize = 12, ClearTextOnFocus = false}, pFly)
+new("UICorner", {CornerRadius = UDim.new(0, 8)}, aBox)
+aBox.FocusLost:Connect(function() CFG.BoostArgs = aBox.Text; saveCfg() end)
+stepper(pFly, "Gửi remote mỗi (giây)", "BoostEvery", 0.05, 0.05, 5, 2)
+button(pFly, "📋 Liệt kê remote vào Log", function()
+    if not folder then return notify("Remote", "Không có PaperPlaneRemotes") end
+    for _, r in ipairs(folder:GetChildren()) do log("[REMOTE] " .. r.ClassName .. " : " .. r.Name) end
+    notify("Remote", "Xem tab Log")
+end, Color3.fromRGB(45, 55, 105))
 stepper(pFly, "Độ cao giữ (stud)", "HoldHeight", 5, -20, 100, 0)
 stepper(pFly, "Tốc độ tối đa (lực đẩy)", "FlySpeed", 50, 50, 1000, 0)
 stepper(pFly, "Lực đẩy trước", "Push", 10, 10, 300, 0)
@@ -2352,6 +2669,37 @@ button(pFly, "🔁 Đổi cổng (thử cổng khác)", function()
     curGate, gateChosen = nil, false
     notify("Cổng", gates[gateOverride].Name .. " (" .. gateOverride .. "/" .. #gates .. ")")
 end)
+
+-- Tab Lộ trình
+local pRoute = addTab("Lộ trình", "🗺")
+Route.info = infoLabel(pRoute, 46)
+toggle(pRoute, "Bay theo lộ trình", "UseRoute")
+toggle(pRoute, "Hiện điểm + đường nối trên map", "RouteShow", function() routeDraw() end)
+button(pRoute, "➕ Thêm điểm tại vị trí hiện tại", function()
+    local r = (inFlight and planeRoot()) or root()
+    if r then routeAdd(r.Position) end
+end)
+local pickBtn
+pickBtn = button(pRoute, "🖱 Click map để thêm điểm: TẮT", function()
+    State.pickRoute = not State.pickRoute
+    pickBtn.Text = "🖱 Click map để thêm điểm: " .. (State.pickRoute and "BẬT (bấm lại để tắt)" or "TẮT")
+end, Color3.fromRGB(45, 55, 105))
+local rBox = new("TextBox", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = Color3.fromRGB(35, 40, 70),
+    PlaceholderText = "Nhập X, Y, Z rồi Enter để thêm điểm", Text = "", TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.Gotham, TextSize = 13, ClearTextOnFocus = false}, pRoute)
+new("UICorner", {CornerRadius = UDim.new(0, 8)}, rBox)
+rBox.FocusLost:Connect(function(enter)
+    if not enter then return end
+    local nums = {}
+    for n in rBox.Text:gmatch("%-?%d+%.?%d*") do nums[#nums + 1] = tonumber(n) end
+    if #nums >= 3 then routeAdd(Vector3.new(nums[1], nums[2], nums[3])); rBox.Text = ""
+    else notify("Lộ trình", "Nhập đủ 3 số X, Y, Z") end
+end)
+button(pRoute, "↶ Xóa điểm cuối", routeUndo, Color3.fromRGB(45, 55, 105))
+button(pRoute, "🗑 Xóa cả lộ trình", routeClear, Color3.fromRGB(150, 70, 70))
+stepper(pRoute, "Bán kính coi là qua điểm", "RouteRadius", 5, 10, 300, 0)
+stepper(pRoute, "Nâng điểm click lên (stud)", "RouteLift", 2, 0, 100, 0)
+infoLabel(pRoute, 74).Text = "Đặt điểm vòng quanh vật cản (điểm Y = độ cao máy bay sẽ giữ). Máy bay lần lượt tới từng điểm, xong thì tự lái tới cổng.\nVàng = điểm, xanh dương = đường nối, xanh lá = tia từ máy bay tới điểm đang nhắm."
 
 -- Tab Tọa độ
 local pWp = addTab("Tọa độ", "🧭")
@@ -2442,12 +2790,16 @@ end)
 stepper(pPlayer, "Tốc độ bay", "PFlySpeed", 0.5, 0.5, 20, 1)
 noclipToggle = toggle(pPlayer, "Xuyên vật thể (nhân vật)", "Noclip")
 toggle(pPlayer, "Nhảy vô hạn", "InfJump")
-infoLabel(pPlayer, 44).Text = "Phím tắt (PC): F = bay, J = xuyên vật thể, K = bật/tắt Auto Ném, LeftCtrl = ẩn/hiện bảng.\nMobile: bấm nút tròn H để ẩn/hiện bảng."
+infoLabel(pPlayer, 44).Text = "Phím tắt (PC): F = bay, J = xuyên vật thể, K = bật/tắt Auto Ném, L = chụp nhãn % vào Log, LeftCtrl = ẩn/hiện bảng.\nMobile: bấm nút tròn H để ẩn/hiện bảng."
 
 -- Tab Tiện ích
 local pUtil = addTab("Tiện ích", "🧰")
 toggle(pUtil, "Auto thu coin/kẹo (nhân vật)", "AutoCollect")
 toggle(pUtil, "ESP tên người chơi", "ESP", function(on) if not on then clearESP() end end)
+toggle(pUtil, "ESP đỏ vật cản (cả khi chưa ném)", "ObsESP", function(on) if not on then espClear() end end)
+stepper(pUtil, "ESP: tầm xa (stud)", "EspRange", 500, 500, 20000, 0)
+stepper(pUtil, "ESP: số vật tối đa", "EspMax", 50, 50, 1000, 0)
+stepper(pUtil, "ESP: dải cao quanh máy bay", "EspBand", 1, 2, 40, 0)
 toggle(pUtil, "FullBright", "FullBright", function(on) if on then applyLight() else restoreLight("bright") end end)
 toggle(pUtil, "Không sương mù", "NoFog", function(on) if on then applyLight() else restoreLight("fog") end end)
 toggle(pUtil, "Làm mờ nền game", "Blur", function(on) blur.Size = on and 14 or 0 end)
@@ -2513,6 +2865,8 @@ selectTab("Auto Ném")
 end
 
 buildUI()
+routeLoad()
+routeDraw()
 
 ------------------------------------------------------------------
 -- PHÍM TẮT
@@ -2527,6 +2881,17 @@ bind(UserInputService.InputBegan:Connect(function(input, processed)
     if CFG.DisableKeybinds then return end
     if input.KeyCode == Enum.KeyCode.F then flyToggle:Set(not CFG.PFly)
     elseif input.KeyCode == Enum.KeyCode.J then noclipToggle:Set(not CFG.Noclip)
+    elseif input.KeyCode == Enum.KeyCode.L then
+        local cnt = 0
+        for _, o in ipairs(guiPool(true)) do
+            if o.Parent and o.Text:find("%d%s*%%") then
+                cnt += 1
+                if cnt <= 25 then
+                    log(("[%%] %s | %q | hiện=%s"):format(o:GetFullName(), o.Text, tostring(visibleChain(o))))
+                end
+            end
+        end
+        notify("Nhãn %", cnt .. " nhãn có %, xem tab Log")
     elseif input.KeyCode == Enum.KeyCode.K then
         if State.throwToggle then State.throwToggle:Set(not CFG.AutoThrow) end
     end
@@ -2603,6 +2968,10 @@ getgenv().PPHubUnload = function()
     pcall(releaseKeys)
     clearThrust()
     stopFly()
+    pcall(lockPlayer, false)
+    pcall(espClear)
+    pcall(function() if routeFolder then routeFolder:Destroy() end end)
+    pcall(function() if planeHL then planeHL:Destroy() end end)
     clearESP()
     if CFG.FullBright then restoreLight("bright") end
     if CFG.NoFog then restoreLight("fog") end
@@ -2615,4 +2984,4 @@ getgenv().PPHubUnload = function()
 end
 
 if CFG.AutoExecute then queueAutoExec() end
-notify("H-HUB", "Đã tải v6.0. Bật Auto Ném (hoặc phím K) - giữ chuột 1 giây rồi nhả.")
+notify("H-HUB", "Đã tải v7.0 (P1-P5). Bấm L để chụp nhãn % vào Log.")
